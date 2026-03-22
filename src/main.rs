@@ -43,17 +43,19 @@ fn run() -> Result<i32> {
             .context("failed to write backend stderr")?;
     }
 
-    let render_mode = render::RenderMode::detect();
-    let rendered = if render_mode.side_by_side {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let document = unified_diff::parse(&stdout);
-        let palette = render::TintPalette::detect();
-        render::render_document(&document, render_mode.width, &palette)
-    } else {
-        String::from_utf8_lossy(&output.stdout).into_owned()
-    };
+    let raw_stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let document = unified_diff::parse(&raw_stdout);
+    let palette = render::TintPalette::detect();
 
-    if !pager::maybe_page(&rendered)? {
+    let rendered = pager::page_or_render(|width| {
+        if render::should_render_side_by_side(width) {
+            render::render_document(&document, width, &palette)
+        } else {
+            render::render_inline_document(&document, width, &palette)
+        }
+    })?;
+
+    if let Some(rendered) = rendered {
         io::stdout()
             .write_all(rendered.as_bytes())
             .context("failed to write rendered diff")?;

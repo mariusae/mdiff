@@ -21,23 +21,33 @@ use std::io::Write;
 
 const MOUSE_SCROLL_LINES: usize = 3;
 
-pub fn maybe_page(output: &str) -> Result<bool> {
+pub fn page_or_render<F>(render: F) -> Result<Option<String>>
+where
+    F: Fn(usize) -> String,
+{
     if !std::io::stdout().is_terminal() {
-        return Ok(false);
+        return Ok(Some(render(0)));
     }
 
-    let (_, rows) = terminal::size().context("failed to read terminal size")?;
-    if line_count(output) <= rows as usize {
-        return Ok(false);
+    let (width, rows) = terminal::size().context("failed to read terminal size")?;
+    let width = width as usize;
+    let rows = rows as usize;
+    let initial_output = render(width);
+
+    if line_count(&initial_output) <= rows {
+        return Ok(Some(initial_output));
     }
 
-    page(output)?;
-    Ok(true)
+    page(render, width, rows, initial_output)?;
+    Ok(None)
 }
 
-fn page(output: &str) -> Result<()> {
+fn page<F>(render: F, width: usize, height: usize, initial_output: String) -> Result<()>
+where
+    F: Fn(usize) -> String,
+{
     let mut stdout = io::stdout();
-    let mut state = PagerState::new(output);
+    let mut state = PagerState::new(render, width, height, initial_output);
 
     terminal::enable_raw_mode().context("failed to enable raw mode")?;
     execute!(
@@ -62,7 +72,10 @@ fn page(output: &str) -> Result<()> {
     result
 }
 
-fn run_pager(stdout: &mut io::Stdout, state: &mut PagerState) -> Result<()> {
+fn run_pager<F>(stdout: &mut io::Stdout, state: &mut PagerState<F>) -> Result<()>
+where
+    F: Fn(usize) -> String,
+{
     loop {
         state.refresh_dimensions()?;
         draw(stdout, state)?;
@@ -87,7 +100,10 @@ fn run_pager(stdout: &mut io::Stdout, state: &mut PagerState) -> Result<()> {
     }
 }
 
-fn draw(stdout: &mut io::Stdout, state: &PagerState) -> Result<()> {
+fn draw<F>(stdout: &mut io::Stdout, state: &PagerState<F>) -> Result<()>
+where
+    F: Fn(usize) -> String,
+{
     let height = state.viewport_height();
     queue!(stdout, cursor::MoveTo(0, 0), Clear(ClearType::All))
         .context("failed to clear pager screen")?;
@@ -95,7 +111,8 @@ fn draw(stdout: &mut io::Stdout, state: &PagerState) -> Result<()> {
     for row in 0..height {
         queue!(stdout, cursor::MoveTo(0, row as u16)).context("failed to move cursor")?;
         if let Some(line) = state.line_at(row) {
-            queue!(stdout, Print(clip_ansi_text(line, state.width))).context("failed to draw line")?;
+            queue!(stdout, Print(clip_ansi_text(line, state.width)))
+                .context("failed to draw line")?;
         }
     }
 
@@ -142,30 +159,54 @@ fn clip_ansi_text(text: &str, width: usize) -> String {
 }
 
 #[derive(Debug)]
-struct PagerState {
+struct PagerState<F>
+where
+    F: Fn(usize) -> String,
+{
+    render: F,
     lines: Vec<String>,
     offset: usize,
     width: usize,
     height: usize,
 }
 
-impl PagerState {
-    fn new(output: &str) -> Self {
-        let lines = output.lines().map(str::to_owned).collect();
+impl<F> PagerState<F>
+where
+    F: Fn(usize) -> String,
+{
+    fn new(render: F, width: usize, height: usize, initial_output: String) -> Self {
+        let lines = initial_output.lines().map(str::to_owned).collect();
         Self {
+            render,
             lines,
             offset: 0,
-            width: 0,
-            height: 0,
+            width,
+            height,
         }
     }
 
     fn refresh_dimensions(&mut self) -> Result<()> {
         let (width, height) = terminal::size().context("failed to read terminal size")?;
-        self.width = width as usize;
-        self.height = height as usize;
-        self.clamp_offset();
+        self.set_dimensions(width as usize, height as usize);
         Ok(())
+    }
+
+    fn set_dimensions(&mut self, width: usize, height: usize) {
+        let width_changed = self.width != width || self.lines.is_empty();
+        self.width = width;
+        self.height = height;
+
+        if width_changed {
+            self.rerender();
+        } else {
+            self.clamp_offset();
+        }
+    }
+
+    fn rerender(&mut self) {
+        let output = (self.render)(self.width);
+        self.lines = output.lines().map(str::to_owned).collect();
+        self.clamp_offset();
     }
 
     fn viewport_height(&self) -> usize {
@@ -228,8 +269,12 @@ mod tests {
 
     #[test]
     fn pager_page_movement_is_page_sized() {
-        let mut state = PagerState::new("1\n2\n3\n4\n5\n6\n7\n8\n9\n10");
-        state.height = 3;
+        let mut state = PagerState::new(
+            |_| "1\n2\n3\n4\n5\n6\n7\n8\n9\n10".into(),
+            80,
+            3,
+            "1\n2\n3\n4\n5\n6\n7\n8\n9\n10".into(),
+        );
         state.page_down();
         assert_eq!(state.offset, 3);
         state.page_up();
@@ -238,11 +283,21 @@ mod tests {
 
     #[test]
     fn pager_scroll_is_line_sized() {
-        let mut state = PagerState::new("1\n2\n3\n4\n5");
-        state.height = 2;
+        let mut state = PagerState::new(|_| "1\n2\n3\n4\n5".into(), 80, 2, "1\n2\n3\n4\n5".into());
         state.scroll_down(3);
         assert_eq!(state.offset, 3);
         state.scroll_up(2);
         assert_eq!(state.offset, 1);
+    }
+
+    #[test]
+    fn rerenders_when_width_changes() {
+        let mut state =
+            PagerState::new(|width| format!("width={width}"), 80, 10, "width=80".into());
+        assert_eq!(state.line_at(0), Some("width=80"));
+
+        state.set_dimensions(100, 10);
+
+        assert_eq!(state.line_at(0), Some("width=100"));
     }
 }

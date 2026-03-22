@@ -12,9 +12,9 @@ pub enum Item {
 
 #[derive(Debug)]
 pub struct Hunk {
-    pub header: String,
     pub old_start: usize,
     pub new_start: usize,
+    pub new_len: usize,
     pub rows: Vec<Row>,
 }
 
@@ -114,7 +114,7 @@ fn strip_diff_path_prefix(path: &str) -> String {
 }
 
 fn is_redundant_path_meta(line: &str) -> bool {
-    line.starts_with("--- ") || line.starts_with("+++ ")
+    line.starts_with("--- ") || line.starts_with("+++ ") || line.starts_with("index ")
 }
 
 fn flush_hunk(items: &mut Vec<Item>, header: &mut Option<String>, raw_rows: &mut Vec<RawRow>) {
@@ -123,29 +123,35 @@ fn flush_hunk(items: &mut Vec<Item>, header: &mut Option<String>, raw_rows: &mut
         return;
     };
 
-    let (old_start, new_start) = parse_hunk_header(&header).unwrap_or((0, 0));
+    let (old_start, new_start, new_len) = parse_hunk_header(&header).unwrap_or((0, 0, 0));
     let rows = build_rows(std::mem::take(raw_rows));
     items.push(Item::Hunk(Hunk {
-        header,
         old_start,
         new_start,
+        new_len,
         rows,
     }));
 }
 
-fn parse_hunk_header(header: &str) -> Option<(usize, usize)> {
+fn parse_hunk_header(header: &str) -> Option<(usize, usize, usize)> {
     let inner = header.strip_prefix("@@ ")?;
     let inner = inner.split(" @@").next()?;
     let mut parts = inner.split_whitespace();
     let old = parts.next()?;
     let new = parts.next()?;
-    Some((parse_range_start(old)?, parse_range_start(new)?))
+    let (old_start, _) = parse_range(old)?;
+    let (new_start, new_len) = parse_range(new)?;
+    Some((old_start, new_start, new_len))
 }
 
-fn parse_range_start(value: &str) -> Option<usize> {
+fn parse_range(value: &str) -> Option<(usize, usize)> {
     let value = value.strip_prefix(['-', '+'])?;
-    let start = value.split(',').next()?;
-    start.parse().ok()
+    let mut parts = value.split(',');
+    let start: usize = parts.next()?.parse().ok()?;
+    let len = parts
+        .next()
+        .map_or(Some(1usize), |part| part.parse().ok())?;
+    Some((start, len))
 }
 
 fn build_rows(raw_rows: Vec<RawRow>) -> Vec<Row> {
@@ -217,6 +223,7 @@ diff --git a/a.txt b/a.txt
 
         assert_eq!(hunk.old_start, 1);
         assert_eq!(hunk.new_start, 1);
+        assert_eq!(hunk.new_len, 2);
         assert_eq!(
             hunk.rows,
             vec![
