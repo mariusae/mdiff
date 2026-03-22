@@ -309,7 +309,7 @@ fn render_file_section(
                 let elided = omitted_lines_above(items, &hunk_positions, hunk_index, hunk);
                 let mut show_gap_continuation = false;
                 if elided > 0 {
-                    output.push_str(&render_compact_elision_row(layout, elided));
+                    output.push_str(&render_compact_elision_row(layout));
                     output.push('\n');
                     show_gap_continuation = true;
                 }
@@ -363,10 +363,7 @@ fn layout_for(document: &Document, width: usize) -> Layout {
         })
         .max()
         .unwrap_or(0);
-    let max_elided_lines = max_elided_lines(document);
-    let center_number_width = MIN_LINE_NUMBER_WIDTH
-        .max(digit_count(max_right_line))
-        .max(1 + digit_count(max_elided_lines));
+    let center_number_width = MIN_LINE_NUMBER_WIDTH.max(digit_count(max_right_line));
     let reserved = center_number_width + PANE_GAP.len() * 2;
     let text_space = width.saturating_sub(reserved);
     let left_text_width = text_space / 2;
@@ -422,28 +419,6 @@ fn max_inline_hunk_line(hunk: &Hunk) -> usize {
     }
 
     max_line
-}
-
-fn max_elided_lines(document: &Document) -> usize {
-    let mut max_elided = 0usize;
-    let mut previous_hunk: Option<&Hunk> = None;
-
-    for item in &document.items {
-        match item {
-            Item::FileHeader(_) => previous_hunk = None,
-            Item::Hunk(hunk) => {
-                let elided = match previous_hunk {
-                    Some(previous) => hunk.new_start.saturating_sub(hunk_end(previous) + 1),
-                    None => hunk.new_start.saturating_sub(1),
-                };
-                max_elided = max_elided.max(elided);
-                previous_hunk = Some(hunk);
-            }
-            Item::Meta(_) => {}
-        }
-    }
-
-    max_elided
 }
 
 fn max_hunk_new_line(hunk: &Hunk) -> usize {
@@ -509,21 +484,18 @@ fn render_file_header(path: &str) -> String {
     format!("\u{1b}[1m{path}\u{1b}[0m")
 }
 
-fn render_compact_elision_row(layout: Layout, elided: usize) -> String {
+fn render_compact_elision_row(layout: Layout) -> String {
     let mut output = String::new();
     output.push_str(&render_plain_cell("", layout.left_text_width));
     output.push_str(PANE_GAP);
-    output.push_str(&render_elided_marker_cell(
-        elided,
-        layout.center_number_width,
-    ));
+    output.push_str(&render_elided_marker_cell(layout.center_number_width));
     output.push_str(PANE_GAP);
     output.push_str(&" ".repeat(layout.right_text_width));
     output
 }
 
-fn render_inline_ellipsis(line_number_width: usize, elided: usize) -> String {
-    render_elided_marker_cell(elided, line_number_width + 1)
+fn render_inline_ellipsis(line_number_width: usize, _elided: usize) -> String {
+    format!("{:>line_number_width$}", "⋮")
 }
 
 fn render_inline_context_line(line_number: usize, text: &str, line_number_width: usize) -> String {
@@ -626,11 +598,10 @@ fn inline_available_width(width: usize, prefix: &str) -> usize {
     }
 }
 
-fn render_elided_marker_cell(elided: usize, width: usize) -> String {
-    let digits = clip_plain_text(&elided.to_string(), width.saturating_sub(1));
-    let digits_width = display_width(&digits);
-    let left_pad = width.saturating_sub(digits_width + 1);
-    format!("{}\u{1b}[3m{}\u{1b}[0m⋮", " ".repeat(left_pad), digits,)
+fn render_elided_marker_cell(width: usize) -> String {
+    let left_pad = width.saturating_sub(1) / 2;
+    let right_pad = width.saturating_sub(1 + left_pad);
+    format!("{}⋮{}", " ".repeat(left_pad), " ".repeat(right_pad))
 }
 
 fn render_row(
@@ -931,8 +902,7 @@ mod tests {
 
         let rendered = render_document(&document, 140, &palette);
         assert!(rendered.contains("\u{1b}[1mdemo.txt\u{1b}[0m"));
-        assert!(rendered.contains("\u{1b}[3m"));
-        assert!(rendered.contains("\u{1b}[3m2\u{1b}[0m⋮"));
+        assert!(rendered.contains("⋮"));
         assert!(!rendered.contains("@@ -1 +1 @@"));
         assert!(rendered.contains("\u{1b}[48;5;240m"));
         assert!(rendered.contains("\u{1b}[2;48;5;240m"));
@@ -976,8 +946,7 @@ mod tests {
 
         let rendered = render_inline_document(&document, 80, &palette);
         assert!(rendered.contains("\u{1b}[1msrc/unified_diff.rs\u{1b}[0m"));
-        assert!(rendered.contains("\u{1b}[3m14\u{1b}[0m⋮"));
-        assert!(rendered.contains("\u{1b}[3m108\u{1b}[0m⋮"));
+        assert!(rendered.contains("   ⋮"));
         assert!(rendered.contains("  15  \u{1b}[2m    pub old_start: usize,"));
         assert!(rendered.contains("  16 -    pub old_len: usize,"));
         assert!(rendered.contains("  16  \u{1b}[2m    pub new_start: usize,"));
@@ -1010,7 +979,7 @@ mod tests {
         };
 
         let rendered = render_document(&document, 140, &palette);
-        assert!(rendered.contains("\u{1b}[3m8\u{1b}[0m⋮"));
+        assert!(rendered.contains(" ⋮ "));
         assert!(rendered.contains(".."));
         assert!(rendered.contains("\u{1b}[1m 10 \u{1b}[0m"));
     }
@@ -1072,15 +1041,11 @@ mod tests {
 
     #[test]
     fn renders_centered_italic_chunk_header() {
-        let header = render_compact_elision_row(
-            Layout {
-                center_number_width: 4,
-                left_text_width: 6,
-                right_text_width: 6,
-            },
-            3,
-        );
-        assert!(header.contains("\u{1b}[3m"));
-        assert!(header.contains("\u{1b}[3m3\u{1b}[0m⋮"));
+        let header = render_compact_elision_row(Layout {
+            center_number_width: 4,
+            left_text_width: 6,
+            right_text_width: 6,
+        });
+        assert!(header.contains(" ⋮  "));
     }
 }

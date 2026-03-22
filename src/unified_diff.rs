@@ -181,7 +181,10 @@ fn strip_diff_path_prefix(path: &str) -> String {
 }
 
 fn is_redundant_path_meta(line: &str) -> bool {
-    line.starts_with("--- ") || line.starts_with("+++ ") || line.starts_with("index ")
+    line.starts_with("--- ")
+        || line.starts_with("+++ ")
+        || line.starts_with("index ")
+        || line.starts_with("new file mode ")
 }
 
 fn flush_hunk(items: &mut Vec<Item>, header: &mut Option<String>, raw_rows: &mut Vec<RawRow>) {
@@ -343,5 +346,20 @@ diff -r 1234abcd -r abcd1234 path/to/demo.txt
             &doc.items[0],
             Item::FileHeader(name) if name == "path/to/demo.txt"
         ));
+    }
+
+    #[test]
+    fn skips_new_file_mode_metadata() {
+        let input = "\
+diff --git a/in.txt b/in.txt
+new file mode 100644
+@@ -0,0 +1 @@
++hello
+";
+
+        let doc = parse(input);
+        assert_eq!(doc.items.len(), 2);
+        assert!(matches!(&doc.items[0], Item::FileHeader(name) if name == "in.txt"));
+        assert!(matches!(&doc.items[1], Item::Hunk(_)));
     }
 }
