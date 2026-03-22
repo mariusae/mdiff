@@ -24,6 +24,7 @@ use std::io::Write;
 use unicode_width::UnicodeWidthChar;
 
 const MOUSE_SCROLL_LINES: usize = 3;
+const HORIZONTAL_SCROLL_COLUMNS: usize = 8;
 const FILE_FILTER_PROMPT: &str = "› ";
 const HELP_LINES: &[&str] = &[
     "mdiff help",
@@ -36,6 +37,7 @@ const HELP_LINES: &[&str] = &[
     "              page down",
     "  g/Home      jump to top",
     "  G/End       jump to bottom",
+    "  Left/Right  scroll horizontally",
     "  Mouse wheel scroll",
     "",
     "Search",
@@ -88,6 +90,13 @@ struct TextStyle {
 struct StyledCell {
     ch: char,
     style: TextStyle,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PlainCell {
+    ch: char,
     start: usize,
     end: usize,
 }
@@ -174,6 +183,8 @@ where
                     KeyCode::Esc => return Ok(()),
                     KeyCode::Up | KeyCode::PageUp => state.page_up(),
                     KeyCode::Down | KeyCode::PageDown | KeyCode::Char(' ') => state.page_down(),
+                    KeyCode::Left => state.scroll_left(),
+                    KeyCode::Right => state.scroll_right(),
                     KeyCode::Home | KeyCode::Char('g') => state.to_top(),
                     KeyCode::End | KeyCode::Char('G') => state.to_bottom(),
                     _ => {}
@@ -247,38 +258,11 @@ fn line_count(output: &str) -> usize {
 }
 
 fn clip_ansi_text(text: &str, width: usize) -> String {
-    let mut rendered = String::new();
-    let mut used = 0usize;
-    let mut chars = text.chars().peekable();
-    let mut saw_ansi = false;
+    clip_ansi_text_from(text, 0, width)
+}
 
-    while let Some(ch) = chars.next() {
-        if ch == '\u{1b}' {
-            saw_ansi = true;
-            rendered.push(ch);
-            while let Some(next) = chars.next() {
-                rendered.push(next);
-                if next == 'm' {
-                    break;
-                }
-            }
-            continue;
-        }
-
-        let ch_width = char_width(ch);
-        if used + ch_width > width {
-            break;
-        }
-
-        rendered.push(ch);
-        used += ch_width;
-    }
-
-    if saw_ansi {
-        rendered.push_str("\u{1b}[0m");
-    }
-
-    rendered
+fn clip_ansi_text_from(text: &str, start_col: usize, width: usize) -> String {
+    render_visible_cells(&parse_styled_cells(text), start_col, width, &[], None)
 }
 
 fn strip_ansi_text(text: &str) -> String {
@@ -302,6 +286,23 @@ fn strip_ansi_text(text: &str) -> String {
     }
 
     rendered
+}
+
+fn parse_plain_cells(text: &str) -> Vec<PlainCell> {
+    let mut cells = Vec::new();
+    let mut plain_offset = 0usize;
+
+    for ch in text.chars() {
+        let start = plain_offset;
+        plain_offset += ch.len_utf8();
+        cells.push(PlainCell {
+            ch,
+            start,
+            end: plain_offset,
+        });
+    }
+
+    cells
 }
 
 fn parse_styled_cells(text: &str) -> Vec<StyledCell> {
@@ -390,21 +391,53 @@ fn apply_sgr(style: &mut TextStyle, sequence: &str) {
 
 fn render_highlighted_line(
     text: &str,
+    start_col: usize,
     width: usize,
     matches: &[SearchMatch],
     search_bg: Option<AnsiColor>,
 ) -> String {
-    if matches.is_empty() {
-        return clip_ansi_text(text, width);
+    render_visible_cells(
+        &parse_styled_cells(text),
+        start_col,
+        width,
+        matches,
+        search_bg,
+    )
+}
+
+fn render_visible_cells(
+    cells: &[StyledCell],
+    start_col: usize,
+    width: usize,
+    matches: &[SearchMatch],
+    search_bg: Option<AnsiColor>,
+) -> String {
+    if width == 0 {
+        return String::new();
     }
 
+    let total_width: usize = cells.iter().map(|cell| char_width(cell.ch)).sum();
+    let line_background = cells.iter().find_map(|cell| cell.style.background);
+    let right_overflow = total_width > start_col.saturating_add(width);
+    let visible_width = if right_overflow {
+        width.saturating_sub(1)
+    } else {
+        width
+    };
     let mut rendered = String::new();
     let mut current_style = TextStyle::default();
     let mut used = 0usize;
+    let mut skipped = 0usize;
 
-    for cell in parse_styled_cells(text) {
+    for cell in cells {
         let ch_width = char_width(cell.ch);
-        if used + ch_width > width {
+
+        if skipped + ch_width <= start_col {
+            skipped += ch_width;
+            continue;
+        }
+
+        if used + ch_width > visible_width {
             break;
         }
 
@@ -425,13 +458,39 @@ fn render_highlighted_line(
 
         rendered.push(cell.ch);
         used += ch_width;
+        skipped += ch_width;
     }
 
     if current_style != TextStyle::default() {
         rendered.push_str("\u{1b}[0m");
     }
 
+    if let Some(background) = line_background
+        && used < visible_width
+    {
+        if let Some(prefix) = style_prefix(TextStyle {
+            background: Some(background),
+            ..TextStyle::default()
+        }) {
+            rendered.push_str(&prefix);
+            rendered.push_str(&" ".repeat(visible_width - used));
+            rendered.push_str("\u{1b}[0m");
+        }
+    }
+
+    if right_overflow {
+        rendered.push('»');
+    }
+
     rendered
+}
+
+fn plain_offset_to_column(text: &str, offset: usize) -> usize {
+    parse_plain_cells(text)
+        .into_iter()
+        .take_while(|cell| cell.end <= offset)
+        .map(|cell| char_width(cell.ch))
+        .sum()
 }
 
 fn cell_is_highlighted(cell: &StyledCell, matches: &[SearchMatch]) -> bool {
@@ -606,6 +665,7 @@ where
     lines: Vec<String>,
     plain_lines: Vec<String>,
     offset: usize,
+    horizontal_offset: usize,
     width: usize,
     height: usize,
     search: SearchMode,
@@ -640,6 +700,7 @@ where
             lines,
             plain_lines,
             offset: 0,
+            horizontal_offset: 0,
             width,
             height,
             search: SearchMode::Inactive,
@@ -715,6 +776,7 @@ where
         let matches = self.matches_for_line(line_index);
         Some(render_highlighted_line(
             line,
+            self.horizontal_offset,
             self.width,
             &matches,
             self.search_bg,
@@ -749,12 +811,37 @@ where
         self.lines.len().saturating_sub(self.viewport_height())
     }
 
+    fn max_horizontal_offset(&self) -> usize {
+        if self.width == 0 {
+            return 0;
+        }
+
+        self.plain_lines
+            .iter()
+            .map(|line| display_width(line))
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(self.width)
+    }
+
     fn page_size(&self) -> usize {
         self.viewport_height().max(1)
     }
 
     fn clamp_offset(&mut self) {
         self.offset = self.offset.min(self.max_offset());
+        self.horizontal_offset = self.horizontal_offset.min(self.max_horizontal_offset());
+    }
+
+    fn scroll_left(&mut self) {
+        self.horizontal_offset = self
+            .horizontal_offset
+            .saturating_sub(HORIZONTAL_SCROLL_COLUMNS);
+    }
+
+    fn scroll_right(&mut self) {
+        self.horizontal_offset =
+            (self.horizontal_offset + HORIZONTAL_SCROLL_COLUMNS).min(self.max_horizontal_offset());
     }
 
     fn handle_hud_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
@@ -1044,20 +1131,41 @@ where
     }
 
     fn jump_to_current_match(&mut self) {
-        let Some(line) = self.current_match_line() else {
+        let Some((line, start)) = self.current_match_position() else {
             return;
         };
         let anchor = self.viewport_height() / 2;
         self.offset = line.saturating_sub(anchor).min(self.max_offset());
+        self.reveal_line_column(line, start);
     }
 
-    fn current_match_line(&self) -> Option<usize> {
+    fn current_match_position(&self) -> Option<(usize, usize)> {
         match &self.search {
             SearchMode::Active {
                 matches, current, ..
-            } => matches.get(*current).map(|matched| matched.line),
+            } => matches
+                .get(*current)
+                .map(|matched| (matched.line, matched.start)),
             SearchMode::Inactive | SearchMode::Prompt { .. } => None,
         }
+    }
+
+    fn reveal_line_column(&mut self, line_index: usize, plain_offset: usize) {
+        if self.width == 0 {
+            return;
+        }
+
+        let Some(line) = self.plain_lines.get(line_index) else {
+            return;
+        };
+
+        let column = plain_offset_to_column(line, plain_offset);
+        if column < self.horizontal_offset {
+            self.horizontal_offset = column;
+        } else if column >= self.horizontal_offset + self.width {
+            self.horizontal_offset = column + 1 - self.width;
+        }
+        self.horizontal_offset = self.horizontal_offset.min(self.max_horizontal_offset());
     }
 
     fn matches_for_line(&self, line: usize) -> Vec<SearchMatch> {
@@ -1243,6 +1351,7 @@ mod tests {
     use super::SearchMode;
     use super::build_file_header_lines;
     use super::clip_ansi_text;
+    use super::clip_ansi_text_from;
     use super::filter_file_names;
     use super::find_matches;
     use super::render_centered_overlay_lines;
@@ -1259,6 +1368,12 @@ mod tests {
         let clipped = clip_ansi_text(text, 3);
         assert!(clipped.contains("\u{1b}[1m"));
         assert!(clipped.contains("\u{1b}[0m"));
+    }
+
+    #[test]
+    fn clipped_overflow_uses_right_marker() {
+        assert_eq!(clip_ansi_text_from("abcdefgh", 0, 4), "abc»");
+        assert_eq!(clip_ansi_text_from("abcdefgh", 4, 4), "efgh");
     }
 
     #[test]
@@ -1313,6 +1428,28 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_scroll_is_clamped_to_widest_displayed_line() {
+        let line = "this is a very long line";
+        let mut state = PagerState::new(
+            |_, _| format!("short\n{line}"),
+            10,
+            4,
+            format!("short\n{line}"),
+            Vec::new(),
+        );
+
+        state.scroll_right();
+        state.scroll_right();
+        state.scroll_right();
+
+        assert_eq!(state.horizontal_offset, line.len() - 10);
+
+        state.set_dimensions(20, 4);
+
+        assert_eq!(state.horizontal_offset, line.len() - 20);
+    }
+
+    #[test]
     fn finds_matches_in_all_plain_text() {
         let matches = find_matches(
             &[
@@ -1352,6 +1489,7 @@ mod tests {
     fn highlight_reuses_search_background() {
         let rendered = render_highlighted_line(
             "\u{1b}[1malpha\u{1b}[0m",
+            0,
             80,
             &[super::SearchMatch {
                 line: 0,
@@ -1361,6 +1499,14 @@ mod tests {
             Some(AnsiColor::Indexed(240)),
         );
         assert!(rendered.contains("\u{1b}[1;48;5;240m"));
+    }
+
+    #[test]
+    fn tinted_lines_fill_to_edge_without_forcing_overflow_marker() {
+        let rendered = render_highlighted_line("\u{1b}[48;5;240mabc\u{1b}[0m", 0, 6, &[], None);
+        assert!(rendered.contains("\u{1b}[48;5;240mabc"));
+        assert!(rendered.contains("   \u{1b}[0m"));
+        assert!(!rendered.contains('»'));
     }
 
     #[test]

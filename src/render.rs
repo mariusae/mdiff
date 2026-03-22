@@ -75,7 +75,8 @@ struct StyledLine {
 struct Layout {
     center_number_width: usize,
     left_text_width: usize,
-    right_text_width: usize,
+    right_visible_width: usize,
+    right_render_width: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -136,6 +137,7 @@ pub fn render_document(document: &Document, width: usize, palette: &TintPalette)
 
 pub fn render_inline_document(document: &Document, width: usize, palette: &TintPalette) -> String {
     let line_number_width = inline_line_number_width(document);
+    let inline_render_width = inline_render_width(document, width, line_number_width);
     let mut output = String::new();
     let mut index = 0usize;
 
@@ -151,8 +153,8 @@ pub fn render_inline_document(document: &Document, width: usize, palette: &TintP
                 let section_end = next_file_header_index(&document.items, index + 1);
                 render_inline_file_section(
                     &document.items[index + 1..section_end],
-                    width,
                     line_number_width,
+                    inline_render_width,
                     palette,
                     &mut output,
                 );
@@ -165,8 +167,8 @@ pub fn render_inline_document(document: &Document, width: usize, palette: &TintP
                 let section_end = next_file_header_index(&document.items, index);
                 render_inline_file_section(
                     &document.items[index..section_end],
-                    width,
                     line_number_width,
+                    inline_render_width,
                     palette,
                     &mut output,
                 );
@@ -180,8 +182,8 @@ pub fn render_inline_document(document: &Document, width: usize, palette: &TintP
 
 fn render_inline_file_section(
     items: &[Item],
-    width: usize,
     line_number_width: usize,
+    inline_render_width: usize,
     palette: &TintPalette,
     output: &mut String,
 ) {
@@ -239,8 +241,8 @@ fn render_inline_file_section(
                             output.push_str(&render_inline_inserted_line(
                                 line_number,
                                 text,
-                                width,
                                 line_number_width,
+                                inline_render_width,
                                 palette,
                             ));
                             output.push('\n');
@@ -261,8 +263,8 @@ fn render_inline_file_section(
                                 new_number,
                                 old,
                                 new,
-                                width,
                                 line_number_width,
+                                inline_render_width,
                                 palette,
                             ));
                             output.push('\n');
@@ -337,7 +339,7 @@ fn render_file_section(
                             output.push_str(PANE_GAP);
                             output.push_str(&render_styled_cell(
                                 &right_line,
-                                layout.right_text_width,
+                                layout.right_render_width,
                             ));
                             output.push('\n');
                         }
@@ -367,12 +369,14 @@ fn layout_for(document: &Document, width: usize) -> Layout {
     let reserved = center_number_width + PANE_GAP.len() * 2;
     let text_space = width.saturating_sub(reserved);
     let left_text_width = text_space / 2;
-    let right_text_width = text_space.saturating_sub(left_text_width);
+    let right_visible_width = text_space.saturating_sub(left_text_width);
+    let right_render_width = right_visible_width.max(max_right_render_width(document));
 
     Layout {
         center_number_width,
         left_text_width,
-        right_text_width,
+        right_visible_width,
+        right_render_width,
     }
 }
 
@@ -387,6 +391,11 @@ fn inline_line_number_width(document: &Document) -> usize {
         .max()
         .unwrap_or(0);
     MIN_LINE_NUMBER_WIDTH.max(digit_count(max_line))
+}
+
+fn inline_render_width(document: &Document, width: usize, line_number_width: usize) -> usize {
+    let visible_width = width.saturating_sub(line_number_width + 2);
+    visible_width.max(max_inline_render_width(document))
 }
 
 fn max_inline_hunk_line(hunk: &Hunk) -> usize {
@@ -447,6 +456,58 @@ fn max_hunk_new_line(hunk: &Hunk) -> usize {
     max_line
 }
 
+fn max_right_render_width(document: &Document) -> usize {
+    document
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Hunk(hunk) => Some(max_hunk_right_render_width(hunk)),
+            Item::FileHeader(_) | Item::Meta(_) => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn max_hunk_right_render_width(hunk: &Hunk) -> usize {
+    hunk.rows
+        .iter()
+        .map(|row| match row {
+            Row::Context(text) | Row::Insert(text) => display_width(&expand_tabs(text)),
+            Row::Change { new, .. } => display_width(&expand_tabs(new)),
+            Row::Delete(_) | Row::Annotation(_) => 0,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn max_inline_render_width(document: &Document) -> usize {
+    document
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Hunk(hunk) => Some(max_hunk_inline_render_width(hunk)),
+            Item::FileHeader(_) | Item::Meta(_) => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn max_hunk_inline_render_width(hunk: &Hunk) -> usize {
+    hunk.rows
+        .iter()
+        .map(|row| match row {
+            Row::Context(text) | Row::Delete(text) | Row::Insert(text) => {
+                display_width(&expand_tabs(text))
+            }
+            Row::Change { old, new } => {
+                display_width(&expand_tabs(old)).max(display_width(&expand_tabs(new)))
+            }
+            Row::Annotation(_) => 0,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 fn next_file_header_index(items: &[Item], start: usize) -> usize {
     items[start..]
         .iter()
@@ -490,7 +551,7 @@ fn render_compact_elision_row(layout: Layout) -> String {
     output.push_str(PANE_GAP);
     output.push_str(&render_elided_marker_cell(layout.center_number_width));
     output.push_str(PANE_GAP);
-    output.push_str(&" ".repeat(layout.right_text_width));
+    output.push_str(&" ".repeat(layout.right_visible_width));
     output
 }
 
@@ -511,8 +572,8 @@ fn render_inline_deleted_line(line_number: usize, text: &str, line_number_width:
 fn render_inline_inserted_line(
     line_number: usize,
     text: &str,
-    width: usize,
     line_number_width: usize,
+    render_width: usize,
     palette: &TintPalette,
 ) -> String {
     let prefix = format!("{line_number:>line_number_width$} +");
@@ -525,7 +586,7 @@ fn render_inline_inserted_line(
             }],
             background: palette.changed_line_bg,
         },
-        width,
+        render_width,
     )
 }
 
@@ -533,8 +594,8 @@ fn render_inline_changed_line(
     line_number: usize,
     old: &str,
     new: &str,
-    width: usize,
     line_number_width: usize,
+    render_width: usize,
     palette: &TintPalette,
 ) -> String {
     let prefix = format!("{line_number:>line_number_width$} +");
@@ -544,26 +605,15 @@ fn render_inline_changed_line(
             segments: diff_segments(&expand_tabs(old), &expand_tabs(new)),
             background: palette.changed_line_bg,
         },
-        width,
+        render_width,
     )
 }
 
-fn render_inline_styled_line(prefix: String, line: StyledLine, width: usize) -> String {
+fn render_inline_styled_line(prefix: String, line: StyledLine, _render_width: usize) -> String {
     let mut output = prefix;
-    let available_width = inline_available_width(width, &output);
-    let mut used = 0usize;
 
     for segment in line.segments {
-        if used >= available_width {
-            break;
-        }
-
-        let visible = if width == 0 {
-            segment.text
-        } else {
-            clip_plain_text(&segment.text, available_width - used)
-        };
-        if visible.is_empty() {
+        if segment.text.is_empty() {
             continue;
         }
 
@@ -571,31 +621,12 @@ fn render_inline_styled_line(prefix: String, line: StyledLine, width: usize) -> 
         if !style.is_empty() {
             output.push_str(&style);
         }
-        output.push_str(&visible);
+        output.push_str(&segment.text);
         if !style.is_empty() {
             output.push_str("\u{1b}[0m");
         }
-
-        used += display_width(&visible);
-    }
-
-    if width > 0
-        && let Some(color) = line.background
-        && used < available_width
-    {
-        output.push_str(&ansi_style(Some(color), false));
-        output.push_str(&" ".repeat(available_width - used));
-        output.push_str("\u{1b}[0m");
     }
     output
-}
-
-fn inline_available_width(width: usize, prefix: &str) -> usize {
-    if width == 0 {
-        usize::MAX
-    } else {
-        width.saturating_sub(display_width(prefix))
-    }
 }
 
 fn render_elided_marker_cell(width: usize) -> String {
@@ -757,16 +788,6 @@ fn render_styled_cell(line: &StyledLine, width: usize) -> String {
         used += display_width(&visible);
     }
 
-    if used < width {
-        if let Some(color) = line.background {
-            output.push_str(&ansi_style(Some(color), false));
-            output.push_str(&" ".repeat(width - used));
-            output.push_str("\u{1b}[0m");
-        } else {
-            output.push_str(&" ".repeat(width - used));
-        }
-    }
-
     output
 }
 
@@ -864,6 +885,7 @@ mod tests {
     use super::render_document;
     use super::render_inline_document;
     use super::render_inline_inserted_line;
+    use super::render_styled_cell;
     use crate::terminal_palette::AnsiColor;
     use crate::unified_diff::Document;
     use crate::unified_diff::Hunk;
@@ -990,10 +1012,59 @@ mod tests {
             changed_line_bg: Some(AnsiColor::Indexed(240)),
         };
 
-        let line = render_inline_inserted_line(12, "abc", 20, 4, &palette);
+        let line = render_inline_inserted_line(12, "abc", 4, 14, &palette);
         assert!(line.starts_with("  12 +"));
         assert!(line.contains("\u{1b}[48;5;240mabc"));
-        assert!(line.ends_with("       \u{1b}[0m"));
+        assert!(!line.ends_with("       \u{1b}[0m"));
+    }
+
+    #[test]
+    fn inline_insertions_keep_full_text_for_horizontal_scroll() {
+        let palette = TintPalette {
+            changed_line_bg: Some(AnsiColor::Indexed(240)),
+        };
+
+        let line = render_inline_inserted_line(12, "abcdefghijklmnopqrstuvwxyz", 4, 26, &palette);
+        assert!(line.contains("abcdefghijklmnopqrstuvwxyz"));
+    }
+
+    #[test]
+    fn side_by_side_keeps_full_right_text_for_horizontal_scroll() {
+        let long = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz";
+        let document = Document {
+            items: vec![
+                Item::FileHeader("demo.txt".into()),
+                Item::Hunk(Hunk {
+                    old_start: 1,
+                    new_start: 1,
+                    new_len: 2,
+                    rows: vec![Row::Insert("abc".into()), Row::Insert(long.into())],
+                }),
+            ],
+        };
+        let palette = TintPalette {
+            changed_line_bg: Some(AnsiColor::Indexed(240)),
+        };
+
+        let rendered = render_document(&document, 140, &palette);
+        assert!(rendered.contains(long));
+        assert!(rendered.contains("\u{1b}[48;5;240mabc"));
+        assert!(rendered.contains("abc"));
+        assert!(!rendered.contains("     \u{1b}[0m"));
+    }
+
+    #[test]
+    fn non_tinted_side_by_side_cells_do_not_pad_hidden_spaces() {
+        let line = StyledLine {
+            segments: vec![Segment {
+                text: "abc".into(),
+                dim: true,
+            }],
+            background: None,
+        };
+
+        let rendered = render_styled_cell(&line, 20);
+        assert_eq!(rendered, "\u{1b}[2mabc\u{1b}[0m");
     }
 
     #[test]
@@ -1044,7 +1115,8 @@ mod tests {
         let header = render_compact_elision_row(Layout {
             center_number_width: 4,
             left_text_width: 6,
-            right_text_width: 6,
+            right_visible_width: 6,
+            right_render_width: 6,
         });
         assert!(header.contains(" ⋮  "));
     }
