@@ -4,6 +4,9 @@ use crate::color::perceptual_distance;
 use crossterm::style::Color as CrosstermColor;
 use crossterm::style::query_background_color;
 
+const LIGHT_BG_ALPHA: f32 = 0.01;
+const DARK_BG_ALPHA: f32 = 0.04;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AnsiColor {
     Indexed(u8),
@@ -94,9 +97,9 @@ pub fn tint_diagnostics_for(
 
     let light = is_light(bg);
     let (overlay, alpha) = if light {
-        ((0, 0, 0), 0.04)
+        ((0, 0, 0), LIGHT_BG_ALPHA)
     } else {
-        ((255, 255, 255), 0.12)
+        ((255, 255, 255), DARK_BG_ALPHA)
     };
     let blended_rgb = blend(overlay, bg, alpha);
 
@@ -181,7 +184,7 @@ mod tests {
 
     #[test]
     fn picks_truecolor_or_ansi_color() {
-        let result = best_color((244, 244, 244));
+        let result = best_color((252, 252, 252));
         assert!(matches!(
             result,
             Some(AnsiColor::Rgb(_, _, _)) | Some(AnsiColor::Indexed(_)) | None
@@ -192,7 +195,7 @@ mod tests {
     fn exposes_blended_rgb_in_diagnostics() {
         let diagnostics = tint_diagnostics_for(Ok(Some((255, 255, 255))));
         assert_eq!(diagnostics.queried_bg, Some((255, 255, 255)));
-        assert_eq!(diagnostics.blended_rgb, Some((244, 244, 244)));
+        assert_eq!(diagnostics.blended_rgb, Some((252, 252, 252)));
     }
 
     #[test]
