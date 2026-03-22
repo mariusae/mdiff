@@ -25,6 +25,35 @@ use unicode_width::UnicodeWidthChar;
 
 const MOUSE_SCROLL_LINES: usize = 3;
 const FILE_FILTER_PROMPT: &str = "› ";
+const HELP_LINES: &[&str] = &[
+    "mdiff help",
+    "",
+    "Navigation",
+    "  q           quit pager",
+    "  ?           toggle help",
+    "  Up/PageUp   page up",
+    "  Down/PageDown/Space",
+    "              page down",
+    "  g/Home      jump to top",
+    "  G/End       jump to bottom",
+    "  Mouse wheel scroll",
+    "",
+    "Search",
+    "  /           open search",
+    "  Enter       confirm search",
+    "  n           next match",
+    "  N           previous match",
+    "  Esc         leave search",
+    "",
+    "File filter",
+    "  Ctrl-F      open file filter",
+    "  Type        narrow files",
+    "  Up/Down     jump between files",
+    "  Backspace   delete filter text",
+    "  Enter/Esc   close file filter",
+    "",
+    "Press ? or Esc to close this help.",
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SearchMatch {
@@ -150,11 +179,17 @@ where
                     _ => {}
                 }
             }
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => state.scroll_up(MOUSE_SCROLL_LINES),
-                MouseEventKind::ScrollDown => state.scroll_down(MOUSE_SCROLL_LINES),
-                _ => {}
-            },
+            Event::Mouse(mouse) => {
+                if state.help_open {
+                    continue;
+                }
+
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => state.scroll_up(MOUSE_SCROLL_LINES),
+                    MouseEventKind::ScrollDown => state.scroll_down(MOUSE_SCROLL_LINES),
+                    _ => {}
+                }
+            }
             Event::Resize(_, _) => {}
             _ => {}
         }
@@ -186,6 +221,15 @@ where
             Print(line)
         )
         .context("failed to draw hud line")?;
+    }
+
+    if state.help_open {
+        for (x, y, line) in
+            render_centered_overlay_lines(state.width, state.height, state.search_bg, HELP_LINES)
+        {
+            queue!(stdout, cursor::MoveTo(x, y), Print(line))
+                .context("failed to draw help overlay")?;
+        }
     }
 
     if let Some((column, row)) = state.hud_cursor_position() {
@@ -572,6 +616,7 @@ where
     file_headers: Vec<FileHeaderLine>,
     file_filter_query: String,
     file_filter_open: bool,
+    help_open: bool,
 }
 
 impl<F> PagerState<F>
@@ -605,6 +650,7 @@ where
             file_headers,
             file_filter_query: String::new(),
             file_filter_open: false,
+            help_open: false,
         }
     }
 
@@ -712,6 +758,21 @@ where
     }
 
     fn handle_hud_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        if self.help_open {
+            return match code {
+                KeyCode::Char('?') | KeyCode::Esc => {
+                    self.help_open = false;
+                    true
+                }
+                _ => true,
+            };
+        }
+
+        if code == KeyCode::Char('?') {
+            self.help_open = true;
+            return true;
+        }
+
         if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('f') {
             self.open_file_filter();
             return true;
@@ -1096,6 +1157,10 @@ where
     }
 
     fn hud_cursor_position(&self) -> Option<(u16, u16)> {
+        if self.help_open {
+            return None;
+        }
+
         if self.file_filter_open {
             let prompt = clip_plain_text(
                 &format!("{FILE_FILTER_PROMPT}{}", self.file_filter_query),
@@ -1119,6 +1184,59 @@ where
     }
 }
 
+fn render_centered_overlay_lines(
+    width: usize,
+    height: usize,
+    background: Option<AnsiColor>,
+    lines: &[&str],
+) -> Vec<(u16, u16, String)> {
+    if width == 0 || height == 0 || lines.is_empty() {
+        return Vec::new();
+    }
+
+    let content_width = lines
+        .iter()
+        .map(|line| display_width(line))
+        .max()
+        .unwrap_or(0);
+    let box_width = (content_width + 4).min(width);
+    let box_height = lines.len().min(height);
+    let start_x = width.saturating_sub(box_width) / 2;
+    let start_y = height.saturating_sub(box_height) / 2;
+    let blank = " ".repeat(box_width);
+    let mut rendered = Vec::new();
+
+    for (index, line) in lines.iter().take(box_height).enumerate() {
+        let clipped = clip_plain_text(line, box_width.saturating_sub(4));
+        let row = format!("  {clipped}");
+        let padded = if display_width(&row) < box_width {
+            format!("{row}{}", " ".repeat(box_width - display_width(&row)))
+        } else {
+            row
+        };
+        let bold = index == 0;
+        rendered.push((
+            start_x as u16,
+            (start_y + index) as u16,
+            render_hud_row(&padded, box_width, background, bold),
+        ));
+    }
+
+    if box_height < lines.len() {
+        return rendered;
+    }
+
+    if rendered.is_empty() {
+        rendered.push((
+            start_x as u16,
+            start_y as u16,
+            render_hud_row(&blank, box_width, background, false),
+        ));
+    }
+
+    rendered
+}
+
 #[cfg(test)]
 mod tests {
     use super::PagerState;
@@ -1127,6 +1245,7 @@ mod tests {
     use super::clip_ansi_text;
     use super::filter_file_names;
     use super::find_matches;
+    use super::render_centered_overlay_lines;
     use super::render_highlighted_line;
     use super::render_search_hud;
     use super::strip_ansi_text;
@@ -1383,5 +1502,34 @@ mod tests {
         );
         assert_eq!(headers[0].line, 0);
         assert_eq!(headers[1].line, 2);
+    }
+
+    #[test]
+    fn question_mark_toggles_help_overlay() {
+        let mut state = PagerState::new(
+            |_, _| "file1\nbody".into(),
+            80,
+            10,
+            "file1\nbody".into(),
+            Vec::new(),
+        );
+        assert!(state.handle_hud_key(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(state.help_open);
+        assert!(state.hud_cursor_position().is_none());
+        assert!(state.handle_hud_key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!state.help_open);
+    }
+
+    #[test]
+    fn help_overlay_uses_hud_tint_and_centers_content() {
+        let overlay =
+            render_centered_overlay_lines(40, 20, Some(AnsiColor::Indexed(240)), &["mdiff help"]);
+        assert_eq!(overlay.len(), 1);
+        assert!(overlay[0].0 > 0);
+        assert!(overlay[0].1 > 0);
+        assert!(
+            overlay[0].2.contains("\u{1b}[48;5;240m")
+                || overlay[0].2.contains("\u{1b}[1;48;5;240m")
+        );
     }
 }
