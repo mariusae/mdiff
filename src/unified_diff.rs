@@ -1,16 +1,16 @@
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Document {
     pub items: Vec<Item>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Item {
     FileHeader(String),
     Meta(String),
     Hunk(Hunk),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Hunk {
     pub old_start: usize,
     pub new_start: usize,
@@ -18,7 +18,7 @@ pub struct Hunk {
     pub rows: Vec<Row>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Row {
     Context(String),
     Delete(String),
@@ -86,6 +86,73 @@ pub fn parse(input: &str) -> Document {
     flush_hunk(&mut items, &mut current_header, &mut raw_rows);
 
     Document { items }
+}
+
+impl Document {
+    pub fn file_paths(&self) -> Vec<String> {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                Item::FileHeader(path) => Some(path.clone()),
+                Item::Meta(_) | Item::Hunk(_) => None,
+            })
+            .collect()
+    }
+
+    pub fn filter_files(&self, query: &str) -> Document {
+        if query.is_empty() {
+            return self.clone();
+        }
+
+        let mut items = Vec::new();
+        let mut section = Vec::new();
+        let mut matched_file_sections = 0usize;
+
+        for item in &self.items {
+            match item {
+                Item::FileHeader(path) => {
+                    matched_file_sections +=
+                        flush_filtered_section(&mut items, &mut section, query);
+                    section.push(Item::FileHeader(path.clone()));
+                }
+                Item::Meta(line) => {
+                    if section.is_empty() {
+                        continue;
+                    }
+                    section.push(Item::Meta(line.clone()));
+                }
+                Item::Hunk(hunk) => {
+                    if section.is_empty() {
+                        continue;
+                    }
+                    section.push(Item::Hunk(hunk.clone()));
+                }
+            }
+        }
+
+        matched_file_sections += flush_filtered_section(&mut items, &mut section, query);
+
+        if matched_file_sections == 0 {
+            return Document::default();
+        }
+
+        Document { items }
+    }
+}
+
+fn flush_filtered_section(items: &mut Vec<Item>, section: &mut Vec<Item>, query: &str) -> usize {
+    let Some(Item::FileHeader(path)) = section.first() else {
+        section.clear();
+        return 0;
+    };
+
+    if path.contains(query) {
+        items.extend(section.drain(..));
+        1
+    } else {
+        section.clear();
+        0
+    }
 }
 
 fn parse_file_header(line: &str) -> Option<String> {

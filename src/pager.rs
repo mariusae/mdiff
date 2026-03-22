@@ -8,6 +8,7 @@ use crossterm::event::DisableMouseCapture;
 use crossterm::event::EnableMouseCapture;
 use crossterm::event::Event;
 use crossterm::event::KeyCode;
+use crossterm::event::KeyModifiers;
 use crossterm::event::MouseEventKind;
 use crossterm::execute;
 use crossterm::queue;
@@ -23,6 +24,7 @@ use std::io::Write;
 use unicode_width::UnicodeWidthChar;
 
 const MOUSE_SCROLL_LINES: usize = 3;
+const FILE_FILTER_PROMPT: &str = "› ";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SearchMatch {
@@ -61,33 +63,45 @@ struct StyledCell {
     end: usize,
 }
 
-pub fn page_or_render<F>(render: F) -> Result<Option<String>>
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileHeaderLine {
+    name: String,
+    line: usize,
+}
+
+pub fn page_or_render<F>(files: Vec<String>, render: F) -> Result<Option<String>>
 where
-    F: Fn(usize) -> String,
+    F: Fn(usize, &str) -> String,
 {
     if !std::io::stdout().is_terminal() {
-        return Ok(Some(render(0)));
+        return Ok(Some(render(0, "")));
     }
 
     let (width, rows) = terminal::size().context("failed to read terminal size")?;
     let width = width as usize;
     let rows = rows as usize;
-    let initial_output = render(width);
+    let initial_output = render(width, "");
 
     if line_count(&initial_output) <= rows {
         return Ok(Some(initial_output));
     }
 
-    page(render, width, rows, initial_output)?;
+    page(files, render, width, rows, initial_output)?;
     Ok(None)
 }
 
-fn page<F>(render: F, width: usize, height: usize, initial_output: String) -> Result<()>
+fn page<F>(
+    files: Vec<String>,
+    render: F,
+    width: usize,
+    height: usize,
+    initial_output: String,
+) -> Result<()>
 where
-    F: Fn(usize) -> String,
+    F: Fn(usize, &str) -> String,
 {
     let mut stdout = io::stdout();
-    let mut state = PagerState::new(render, width, height, initial_output);
+    let mut state = PagerState::new(render, width, height, initial_output, files);
 
     terminal::enable_raw_mode().context("failed to enable raw mode")?;
     execute!(
@@ -114,7 +128,7 @@ where
 
 fn run_pager<F>(stdout: &mut io::Stdout, state: &mut PagerState<F>) -> Result<()>
 where
-    F: Fn(usize) -> String,
+    F: Fn(usize, &str) -> String,
 {
     loop {
         state.refresh_dimensions()?;
@@ -122,7 +136,7 @@ where
 
         match event::read().context("failed to read pager input")? {
             Event::Key(key) => {
-                if state.handle_search_key(key.code) {
+                if state.handle_hud_key(key.code, key.modifiers) {
                     continue;
                 }
 
@@ -149,28 +163,34 @@ where
 
 fn draw<F>(stdout: &mut io::Stdout, state: &PagerState<F>) -> Result<()>
 where
-    F: Fn(usize) -> String,
+    F: Fn(usize, &str) -> String,
 {
-    let height = state.viewport_height();
+    let hud_lines = state.hud_lines();
+    let viewport_height = state.height.saturating_sub(hud_lines.len());
+
     queue!(stdout, cursor::MoveTo(0, 0), Clear(ClearType::All))
         .context("failed to clear pager screen")?;
 
-    for row in 0..height {
+    for row in 0..viewport_height {
         queue!(stdout, cursor::MoveTo(0, row as u16)).context("failed to move cursor")?;
         if let Some(line) = state.rendered_line_at(row) {
             queue!(stdout, Print(line)).context("failed to draw line")?;
         }
     }
 
-    if let Some(hud) = state.search_hud_line() {
-        let hud_row = state.height.saturating_sub(1) as u16;
-        queue!(stdout, cursor::MoveTo(0, hud_row), Print(hud))
-            .context("failed to draw search hud")?;
+    let hud_start = state.height.saturating_sub(hud_lines.len());
+    for (index, line) in hud_lines.iter().enumerate() {
+        queue!(
+            stdout,
+            cursor::MoveTo(0, (hud_start + index) as u16),
+            Print(line)
+        )
+        .context("failed to draw hud line")?;
     }
 
-    if let Some((column, row)) = state.search_cursor_position() {
+    if let Some((column, row)) = state.hud_cursor_position() {
         queue!(stdout, cursor::MoveTo(column, row), cursor::Show)
-            .context("failed to place search cursor")?;
+            .context("failed to place hud cursor")?;
     } else {
         queue!(stdout, cursor::Hide).context("failed to hide cursor")?;
     }
@@ -403,6 +423,27 @@ fn style_prefix(style: TextStyle) -> Option<String> {
     }
 }
 
+fn render_hud_row(text: &str, width: usize, background: Option<AnsiColor>, bold: bool) -> String {
+    let mut clipped = clip_plain_text(text, width);
+    let clipped_width = display_width(&clipped);
+    if clipped_width < width {
+        clipped.push_str(&" ".repeat(width - clipped_width));
+    }
+
+    let style = style_prefix(TextStyle {
+        bold,
+        background,
+        ..TextStyle::default()
+    })
+    .unwrap_or_default();
+
+    if style.is_empty() {
+        clipped
+    } else {
+        format!("{style}{clipped}\u{1b}[0m")
+    }
+}
+
 fn render_search_hud(
     query: &str,
     width: usize,
@@ -420,26 +461,45 @@ fn render_search_hud(
         let padding = width.saturating_sub(text_width + status_width);
         text.push_str(&" ".repeat(padding));
         text.push_str(status);
-    } else if text_width < width {
-        text.push_str(&" ".repeat(width - text_width));
     }
 
-    if text_width >= width && status.is_none() {
-        text = clip_plain_text(&text, width);
+    render_hud_row(&text, width, background, false)
+}
+
+fn filter_file_names(files: &[String], query: &str) -> Vec<String> {
+    if query.is_empty() {
+        return files.to_vec();
     }
 
-    match background {
-        Some(color) => format!(
-            "{}{}\u{1b}[0m",
-            style_prefix(TextStyle {
-                background: Some(color),
-                ..TextStyle::default()
-            })
-            .unwrap_or_default(),
-            text
-        ),
-        None => text,
+    files
+        .iter()
+        .filter(|path| path.contains(query))
+        .cloned()
+        .collect()
+}
+
+fn build_file_header_lines(
+    plain_lines: &[String],
+    visible_files: &[String],
+) -> Vec<FileHeaderLine> {
+    let mut headers = Vec::new();
+    let mut next_file = 0usize;
+
+    for (line_index, line) in plain_lines.iter().enumerate() {
+        if next_file >= visible_files.len() {
+            break;
+        }
+
+        if line == &visible_files[next_file] {
+            headers.push(FileHeaderLine {
+                name: visible_files[next_file].clone(),
+                line: line_index,
+            });
+            next_file += 1;
+        }
     }
+
+    headers
 }
 
 fn find_matches(lines: &[String], query: &str) -> Vec<SearchMatch> {
@@ -496,7 +556,7 @@ fn char_width(ch: char) -> usize {
 #[derive(Debug)]
 struct PagerState<F>
 where
-    F: Fn(usize) -> String,
+    F: Fn(usize, &str) -> String,
 {
     render: F,
     lines: Vec<String>,
@@ -507,15 +567,29 @@ where
     search: SearchMode,
     search_bg: Option<AnsiColor>,
     search_message: Option<&'static str>,
+    all_files: Vec<String>,
+    visible_files: Vec<String>,
+    file_headers: Vec<FileHeaderLine>,
+    file_filter_query: String,
+    file_filter_open: bool,
 }
 
 impl<F> PagerState<F>
 where
-    F: Fn(usize) -> String,
+    F: Fn(usize, &str) -> String,
 {
-    fn new(render: F, width: usize, height: usize, initial_output: String) -> Self {
+    fn new(
+        render: F,
+        width: usize,
+        height: usize,
+        initial_output: String,
+        all_files: Vec<String>,
+    ) -> Self {
         let lines: Vec<String> = initial_output.lines().map(str::to_owned).collect();
         let plain_lines = rebuild_plain_lines(&lines);
+        let visible_files = all_files.clone();
+        let file_headers = build_file_header_lines(&plain_lines, &visible_files);
+
         Self {
             render,
             lines,
@@ -526,6 +600,11 @@ where
             search: SearchMode::Inactive,
             search_bg: search_highlight_bg(),
             search_message: None,
+            all_files,
+            visible_files,
+            file_headers,
+            file_filter_query: String::new(),
+            file_filter_open: false,
         }
     }
 
@@ -541,25 +620,42 @@ where
         self.height = height;
 
         if width_changed {
-            self.rerender();
+            let preferred = self.current_top_file_name();
+            self.rerender(preferred);
         } else {
             self.clamp_offset();
         }
     }
 
-    fn rerender(&mut self) {
-        let output = (self.render)(self.width);
+    fn rerender(&mut self, preferred_file: Option<String>) {
+        let output = (self.render)(self.width, &self.file_filter_query);
         self.lines = output.lines().map(str::to_owned).collect();
         self.plain_lines = rebuild_plain_lines(&self.lines);
-        self.refresh_search_matches();
+        self.visible_files = filter_file_names(&self.all_files, &self.file_filter_query);
+        self.file_headers = build_file_header_lines(&self.plain_lines, &self.visible_files);
+
+        if matches!(self.search, SearchMode::Active { .. }) {
+            self.refresh_search_matches();
+        } else {
+            self.restore_offset_for_file(preferred_file);
+        }
+
         self.clamp_offset();
     }
 
     fn viewport_height(&self) -> usize {
-        if self.search_visible() {
-            self.height.saturating_sub(1)
+        self.height.saturating_sub(self.hud_height())
+    }
+
+    fn hud_height(&self) -> usize {
+        if self.file_filter_open {
+            let max_hud_rows = self.height.saturating_sub(1).max(1);
+            let requested_rows = self.visible_files.len().saturating_add(1);
+            requested_rows.min(max_hud_rows)
+        } else if self.search_visible() {
+            1
         } else {
-            self.height
+            0
         }
     }
 
@@ -615,9 +711,23 @@ where
         self.offset = self.offset.min(self.max_offset());
     }
 
-    fn handle_search_key(&mut self, key: KeyCode) -> bool {
-        match (&mut self.search, key) {
+    fn handle_hud_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('f') {
+            self.open_file_filter();
+            return true;
+        }
+
+        if self.file_filter_open {
+            return self.handle_file_filter_key(code, modifiers);
+        }
+
+        self.handle_search_key(code)
+    }
+
+    fn handle_search_key(&mut self, code: KeyCode) -> bool {
+        match (&mut self.search, code) {
             (SearchMode::Inactive, KeyCode::Char('/')) => {
+                self.file_filter_open = false;
                 self.search = SearchMode::Prompt {
                     query: String::new(),
                 };
@@ -668,6 +778,129 @@ where
         }
     }
 
+    fn handle_file_filter_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        match code {
+            KeyCode::Esc | KeyCode::Enter => {
+                self.file_filter_open = false;
+                self.clamp_offset();
+                true
+            }
+            KeyCode::Backspace => {
+                let mut query = self.file_filter_query.clone();
+                query.pop();
+                self.apply_file_filter_query(query);
+                true
+            }
+            KeyCode::Up => {
+                self.navigate_previous_file();
+                true
+            }
+            KeyCode::Down => {
+                self.navigate_next_file();
+                true
+            }
+            KeyCode::Home => {
+                self.jump_to_file_index(0);
+                true
+            }
+            KeyCode::End => {
+                if !self.file_headers.is_empty() {
+                    self.jump_to_file_index(self.file_headers.len() - 1);
+                }
+                true
+            }
+            KeyCode::Char(ch) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                let mut query = self.file_filter_query.clone();
+                query.push(ch);
+                self.apply_file_filter_query(query);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn open_file_filter(&mut self) {
+        self.search = SearchMode::Inactive;
+        self.search_message = None;
+        self.file_filter_open = true;
+        if self.visible_files.is_empty() {
+            self.offset = 0;
+        }
+    }
+
+    fn apply_file_filter_query(&mut self, query: String) {
+        let preferred = self.current_top_file_name();
+        self.file_filter_query = query;
+        self.search = SearchMode::Inactive;
+        self.search_message = None;
+        self.rerender(preferred);
+    }
+
+    fn navigate_previous_file(&mut self) {
+        let Some(current) = self.current_top_file_index() else {
+            self.jump_to_file_index(0);
+            return;
+        };
+
+        if current > 0 {
+            self.jump_to_file_index(current - 1);
+        }
+    }
+
+    fn navigate_next_file(&mut self) {
+        let Some(current) = self.current_top_file_index() else {
+            self.jump_to_file_index(0);
+            return;
+        };
+
+        if current + 1 < self.file_headers.len() {
+            self.jump_to_file_index(current + 1);
+        }
+    }
+
+    fn jump_to_file_index(&mut self, index: usize) {
+        if let Some(header) = self.file_headers.get(index) {
+            self.offset = if self.file_filter_open {
+                header.line
+            } else {
+                header.line.min(self.max_offset())
+            };
+        }
+    }
+
+    fn restore_offset_for_file(&mut self, preferred_file: Option<String>) {
+        let target = preferred_file
+            .and_then(|name| {
+                self.file_headers
+                    .iter()
+                    .position(|header| header.name == name)
+            })
+            .or_else(|| {
+                usize::from(!self.file_headers.is_empty())
+                    .checked_sub(1)
+                    .map(|_| 0)
+            });
+
+        if let Some(index) = target {
+            self.jump_to_file_index(index);
+        } else {
+            self.offset = 0;
+        }
+    }
+
+    fn current_top_file_name(&self) -> Option<String> {
+        self.current_top_file_index()
+            .and_then(|index| self.file_headers.get(index))
+            .map(|header| header.name.clone())
+    }
+
+    fn current_top_file_index(&self) -> Option<usize> {
+        self.file_headers
+            .iter()
+            .rposition(|header| header.line <= self.offset)
+            .or_else(|| (!self.file_headers.is_empty()).then_some(0))
+    }
+
     fn commit_search(&mut self) {
         let SearchMode::Prompt { query } = &self.search else {
             return;
@@ -692,12 +925,7 @@ where
     }
 
     fn refresh_search_matches(&mut self) {
-        let SearchMode::Active {
-            query,
-            matches: _,
-            current,
-        } = &self.search
-        else {
+        let SearchMode::Active { query, current, .. } = &self.search else {
             return;
         };
 
@@ -794,11 +1022,15 @@ where
         }
     }
 
-    fn search_hud_line(&self) -> Option<String> {
+    fn hud_lines(&self) -> Vec<String> {
+        if self.file_filter_open {
+            return self.file_filter_hud_lines();
+        }
+
         match &self.search {
-            SearchMode::Inactive => None,
+            SearchMode::Inactive => Vec::new(),
             SearchMode::Prompt { query } => {
-                Some(render_search_hud(query, self.width, self.search_bg, None))
+                vec![render_search_hud(query, self.width, self.search_bg, None)]
             }
             SearchMode::Active {
                 query,
@@ -814,24 +1046,74 @@ where
                     status.push(' ');
                     status.push_str(message);
                 }
-                Some(render_search_hud(
+                vec![render_search_hud(
                     query,
                     self.width,
                     self.search_bg,
                     Some(&status),
-                ))
+                )]
             }
         }
     }
 
-    fn search_cursor_position(&self) -> Option<(u16, u16)> {
+    fn file_filter_hud_lines(&self) -> Vec<String> {
+        let hud_height = self.hud_height();
+        if hud_height == 0 {
+            return Vec::new();
+        }
+
+        let list_rows = hud_height.saturating_sub(1);
+        let current_index = self.current_top_file_index().unwrap_or(0);
+        let start = if self.visible_files.len() <= list_rows {
+            0
+        } else {
+            current_index.min(self.visible_files.len().saturating_sub(list_rows))
+        };
+        let end = (start + list_rows).min(self.visible_files.len());
+        let current_file = self.current_top_file_name();
+
+        let mut lines = Vec::new();
+        for file in &self.visible_files[start..end] {
+            lines.push(render_hud_row(
+                &format!("  {file}"),
+                self.width,
+                self.search_bg,
+                current_file.as_deref() == Some(file.as_str()),
+            ));
+        }
+
+        while lines.len() < list_rows {
+            lines.push(render_hud_row("", self.width, self.search_bg, false));
+        }
+
+        lines.push(render_hud_row(
+            &format!("{FILE_FILTER_PROMPT}{}", self.file_filter_query),
+            self.width,
+            self.search_bg,
+            false,
+        ));
+        lines
+    }
+
+    fn hud_cursor_position(&self) -> Option<(u16, u16)> {
+        if self.file_filter_open {
+            let prompt = clip_plain_text(
+                &format!("{FILE_FILTER_PROMPT}{}", self.file_filter_query),
+                self.width,
+            );
+            return Some((
+                display_width(&prompt) as u16,
+                self.height.saturating_sub(1) as u16,
+            ));
+        }
+
         let SearchMode::Prompt { query } = &self.search else {
             return None;
         };
 
-        let prefix = clip_plain_text(&format!("/{query}"), self.width);
+        let prompt = clip_plain_text(&format!("/{query}"), self.width);
         Some((
-            display_width(&prefix) as u16,
+            display_width(&prompt) as u16,
             self.height.saturating_sub(1) as u16,
         ))
     }
@@ -841,13 +1123,16 @@ where
 mod tests {
     use super::PagerState;
     use super::SearchMode;
+    use super::build_file_header_lines;
     use super::clip_ansi_text;
+    use super::filter_file_names;
     use super::find_matches;
     use super::render_highlighted_line;
     use super::render_search_hud;
     use super::strip_ansi_text;
     use crate::terminal_palette::AnsiColor;
     use crossterm::event::KeyCode;
+    use crossterm::event::KeyModifiers;
 
     #[test]
     fn clip_ansi_text_preserves_escape_sequences() {
@@ -865,10 +1150,11 @@ mod tests {
     #[test]
     fn pager_page_movement_is_page_sized() {
         let mut state = PagerState::new(
-            |_| "1\n2\n3\n4\n5\n6\n7\n8\n9\n10".into(),
+            |_, _| "1\n2\n3\n4\n5\n6\n7\n8\n9\n10".into(),
             80,
             3,
             "1\n2\n3\n4\n5\n6\n7\n8\n9\n10".into(),
+            Vec::new(),
         );
         state.page_down();
         assert_eq!(state.offset, 3);
@@ -878,7 +1164,13 @@ mod tests {
 
     #[test]
     fn pager_scroll_is_line_sized() {
-        let mut state = PagerState::new(|_| "1\n2\n3\n4\n5".into(), 80, 2, "1\n2\n3\n4\n5".into());
+        let mut state = PagerState::new(
+            |_, _| "1\n2\n3\n4\n5".into(),
+            80,
+            2,
+            "1\n2\n3\n4\n5".into(),
+            Vec::new(),
+        );
         state.scroll_down(3);
         assert_eq!(state.offset, 3);
         state.scroll_up(2);
@@ -887,8 +1179,13 @@ mod tests {
 
     #[test]
     fn rerenders_when_width_changes() {
-        let mut state =
-            PagerState::new(|width| format!("width={width}"), 80, 10, "width=80".into());
+        let mut state = PagerState::new(
+            |width, _| format!("width={width}"),
+            80,
+            10,
+            "width=80".into(),
+            Vec::new(),
+        );
         assert_eq!(state.line_at(0), Some("width=80"));
 
         state.set_dimensions(100, 10);
@@ -914,16 +1211,17 @@ mod tests {
     #[test]
     fn search_matches_rendered_text_without_ansi() {
         let mut state = PagerState::new(
-            |_| "\u{1b}[1malpha\u{1b}[0m\nbeta".into(),
+            |_, _| "\u{1b}[1malpha\u{1b}[0m\nbeta".into(),
             80,
             4,
             "\u{1b}[1malpha\u{1b}[0m\nbeta".into(),
+            Vec::new(),
         );
 
-        assert!(state.handle_search_key(KeyCode::Char('/')));
-        assert!(state.handle_search_key(KeyCode::Char('a')));
-        assert!(state.handle_search_key(KeyCode::Char('l')));
-        assert!(state.handle_search_key(KeyCode::Enter));
+        assert!(state.handle_hud_key(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(state.handle_hud_key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(state.handle_hud_key(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert!(state.handle_hud_key(KeyCode::Enter, KeyModifiers::NONE));
 
         match &state.search {
             SearchMode::Active { matches, .. } => assert_eq!(matches.len(), 1),
@@ -948,57 +1246,56 @@ mod tests {
 
     #[test]
     fn active_search_reserves_bottom_row_for_hud() {
-        let mut state = PagerState::new(|_| "a\nb\nc\nd".into(), 80, 4, "a\nb\nc\nd".into());
-        assert!(state.handle_search_key(KeyCode::Char('/')));
-        assert!(state.handle_search_key(KeyCode::Char('b')));
-        assert!(state.handle_search_key(KeyCode::Enter));
+        let mut state = PagerState::new(
+            |_, _| "a\nb\nc\nd".into(),
+            80,
+            4,
+            "a\nb\nc\nd".into(),
+            Vec::new(),
+        );
+        assert!(state.handle_hud_key(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(state.handle_hud_key(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert!(state.handle_hud_key(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(state.viewport_height(), 3);
-        assert!(state.search_hud_line().is_some());
+        assert_eq!(state.hud_lines().len(), 1);
     }
 
     #[test]
     fn search_navigation_stops_at_edges_and_reports_boundary() {
         let mut state = PagerState::new(
-            |_| "alpha\nbeta alpha\ngamma alpha".into(),
+            |_, _| "alpha\nbeta alpha\ngamma alpha".into(),
             80,
             3,
             "alpha\nbeta alpha\ngamma alpha".into(),
+            Vec::new(),
         );
-        assert!(state.handle_search_key(KeyCode::Char('/')));
-        assert!(state.handle_search_key(KeyCode::Char('a')));
-        assert!(state.handle_search_key(KeyCode::Char('l')));
-        assert!(state.handle_search_key(KeyCode::Char('p')));
-        assert!(state.handle_search_key(KeyCode::Char('h')));
-        assert!(state.handle_search_key(KeyCode::Char('a')));
-        assert!(state.handle_search_key(KeyCode::Enter));
+        assert!(state.handle_hud_key(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(state.handle_hud_key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(state.handle_hud_key(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert!(state.handle_hud_key(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert!(state.handle_hud_key(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert!(state.handle_hud_key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(state.handle_hud_key(KeyCode::Enter, KeyModifiers::NONE));
 
         state.next_match();
         state.next_match();
-        assert!(state.handle_search_key(KeyCode::Char('n')));
+        assert!(state.handle_hud_key(KeyCode::Char('n'), KeyModifiers::NONE));
 
         match &state.search {
             SearchMode::Active { current, .. } => assert_eq!(*current, 2),
             SearchMode::Inactive | SearchMode::Prompt { .. } => panic!("search not active"),
         }
-        assert!(
-            state
-                .search_hud_line()
-                .is_some_and(|line| line.contains("end of file"))
-        );
+        assert!(state.hud_lines().join("\n").contains("end of file"));
 
-        assert!(state.handle_search_key(KeyCode::Char('N')));
-        assert!(state.handle_search_key(KeyCode::Char('N')));
-        assert!(state.handle_search_key(KeyCode::Char('N')));
+        assert!(state.handle_hud_key(KeyCode::Char('N'), KeyModifiers::NONE));
+        assert!(state.handle_hud_key(KeyCode::Char('N'), KeyModifiers::NONE));
+        assert!(state.handle_hud_key(KeyCode::Char('N'), KeyModifiers::NONE));
 
         match &state.search {
             SearchMode::Active { current, .. } => assert_eq!(*current, 0),
             SearchMode::Inactive | SearchMode::Prompt { .. } => panic!("search not active"),
         }
-        assert!(
-            state
-                .search_hud_line()
-                .is_some_and(|line| line.contains("beginning of file"))
-        );
+        assert!(state.hud_lines().join("\n").contains("beginning of file"));
     }
 
     #[test]
@@ -1007,5 +1304,84 @@ mod tests {
         assert!(hud.contains("\u{1b}[48;5;240m"));
         assert!(hud.contains("/alpha"));
         assert!(hud.contains("1/3"));
+    }
+
+    #[test]
+    fn file_filter_narrows_files_and_rerenders_output() {
+        let files = vec!["a.go".into(), "b.rs".into(), "c.go".into()];
+        let mut state = PagerState::new(
+            |_, filter| {
+                if filter.is_empty() {
+                    "a.go\nbody\nb.rs\nbody\nc.go\nbody".into()
+                } else {
+                    format!("{filter}\nfiltered")
+                }
+            },
+            80,
+            10,
+            "a.go\nbody\nb.rs\nbody\nc.go\nbody".into(),
+            files,
+        );
+
+        assert!(state.handle_hud_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert!(state.handle_hud_key(KeyCode::Char('.'), KeyModifiers::NONE));
+        assert!(state.handle_hud_key(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert!(state.handle_hud_key(KeyCode::Char('o'), KeyModifiers::NONE));
+
+        assert_eq!(state.file_filter_query, ".go");
+        assert_eq!(
+            state.visible_files,
+            vec!["a.go".to_owned(), "c.go".to_owned()]
+        );
+        assert_eq!(state.line_at(0), Some(".go"));
+    }
+
+    #[test]
+    fn file_filter_hud_bolds_current_top_file() {
+        let files = vec!["file1".into(), "file2".into()];
+        let initial = "\u{1b}[1mfile1\u{1b}[0m\nx\n\u{1b}[1mfile2\u{1b}[0m\ny".to_owned();
+        let rendered = initial.clone();
+        let mut state = PagerState::new(|_, _| rendered.clone(), 80, 6, initial, files);
+        assert!(state.handle_hud_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        state.navigate_next_file();
+
+        let hud = state.hud_lines().join("\n");
+        assert!(hud.contains("\u{1b}[1m") || hud.contains("\u{1b}[1;48"));
+        assert!(hud.contains("file2"));
+    }
+
+    #[test]
+    fn file_filter_navigation_uses_up_and_down() {
+        let files = vec!["file1".into(), "file2".into()];
+        let initial = "file1\nx\nfile2\ny".to_owned();
+        let rendered = initial.clone();
+        let mut state = PagerState::new(|_, _| rendered.clone(), 80, 6, initial, files);
+        assert!(state.handle_hud_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert!(state.handle_hud_key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.current_top_file_name().as_deref(), Some("file2"));
+        assert!(state.handle_hud_key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(state.current_top_file_name().as_deref(), Some("file1"));
+    }
+
+    #[test]
+    fn file_name_filter_matches_by_substring() {
+        let filtered =
+            filter_file_names(&["foo.go".into(), "bar.rs".into(), "baz.go".into()], ".go");
+        assert_eq!(filtered, vec!["foo.go".to_owned(), "baz.go".to_owned()]);
+    }
+
+    #[test]
+    fn file_headers_are_discovered_in_rendered_output() {
+        let headers = build_file_header_lines(
+            &[
+                "file1".to_owned(),
+                "  body".to_owned(),
+                "file2".to_owned(),
+                "  body".to_owned(),
+            ],
+            &["file1".into(), "file2".into()],
+        );
+        assert_eq!(headers[0].line, 0);
+        assert_eq!(headers[1].line, 2);
     }
 }
