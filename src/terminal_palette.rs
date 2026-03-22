@@ -4,9 +4,9 @@ use crate::color::perceptual_distance;
 use crossterm::style::Color as CrosstermColor;
 use crossterm::style::query_background_color;
 
-const LIGHT_BG_ALPHA: f32 = 0.01;
+const LIGHT_BG_ALPHA: f32 = 0.04;
 const DARK_BG_ALPHA: f32 = 0.04;
-const SEARCH_LIGHT_BG_ALPHA: f32 = 0.08;
+const SEARCH_LIGHT_BG_ALPHA: f32 = 0.10;
 const SEARCH_DARK_BG_ALPHA: f32 = 0.20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -201,6 +201,7 @@ mod tests {
     use super::BackgroundSource;
     use super::best_color;
     use super::tint_diagnostics_for;
+    use super::tint_diagnostics_with_alpha;
     use super::user_message_bg_for;
 
     #[test]
@@ -221,7 +222,14 @@ mod tests {
     fn exposes_blended_rgb_in_diagnostics() {
         let diagnostics = tint_diagnostics_for(Ok(Some((255, 255, 255))));
         assert_eq!(diagnostics.queried_bg, Some((255, 255, 255)));
-        assert_eq!(diagnostics.blended_rgb, Some((252, 252, 252)));
+        assert_eq!(diagnostics.blended_rgb, Some((244, 244, 244)));
+    }
+
+    #[test]
+    fn search_tint_is_stronger_on_light_backgrounds() {
+        let diagnostics = tint_diagnostics_with_alpha(Ok(Some((255, 255, 255))), 0.10, 0.20);
+        assert_eq!(diagnostics.queried_bg, Some((255, 255, 255)));
+        assert_eq!(diagnostics.blended_rgb, Some((229, 229, 229)));
     }
 
     #[test]
