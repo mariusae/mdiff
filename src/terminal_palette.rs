@@ -6,6 +6,8 @@ use crossterm::style::query_background_color;
 
 const LIGHT_BG_ALPHA: f32 = 0.01;
 const DARK_BG_ALPHA: f32 = 0.04;
+const SEARCH_LIGHT_BG_ALPHA: f32 = 0.08;
+const SEARCH_DARK_BG_ALPHA: f32 = 0.20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AnsiColor {
@@ -55,6 +57,14 @@ pub fn user_message_bg() -> Option<AnsiColor> {
     tint_diagnostics().final_color
 }
 
+pub fn search_highlight_bg() -> Option<AnsiColor> {
+    tint_color_for(
+        query_background_rgb(),
+        SEARCH_LIGHT_BG_ALPHA,
+        SEARCH_DARK_BG_ALPHA,
+    )
+}
+
 #[cfg(test)]
 pub fn user_message_bg_for(
     query_result: std::io::Result<Option<(u8, u8, u8)>>,
@@ -68,6 +78,22 @@ pub fn tint_diagnostics() -> TintDiagnostics {
 
 pub fn tint_diagnostics_for(
     query_result: std::io::Result<Option<(u8, u8, u8)>>,
+) -> TintDiagnostics {
+    tint_diagnostics_with_alpha(query_result, LIGHT_BG_ALPHA, DARK_BG_ALPHA)
+}
+
+fn tint_color_for(
+    query_result: std::io::Result<Option<(u8, u8, u8)>>,
+    light_alpha: f32,
+    dark_alpha: f32,
+) -> Option<AnsiColor> {
+    tint_diagnostics_with_alpha(query_result, light_alpha, dark_alpha).final_color
+}
+
+fn tint_diagnostics_with_alpha(
+    query_result: std::io::Result<Option<(u8, u8, u8)>>,
+    light_alpha: f32,
+    dark_alpha: f32,
 ) -> TintDiagnostics {
     let stdout_color_level = stdout_color_level();
     let (query_error, terminal_bg, bg_source) = match query_result {
@@ -97,9 +123,9 @@ pub fn tint_diagnostics_for(
 
     let light = is_light(bg);
     let (overlay, alpha) = if light {
-        ((0, 0, 0), LIGHT_BG_ALPHA)
+        ((0, 0, 0), light_alpha)
     } else {
-        ((255, 255, 255), DARK_BG_ALPHA)
+        ((255, 255, 255), dark_alpha)
     };
     let blended_rgb = blend(overlay, bg, alpha);
 
