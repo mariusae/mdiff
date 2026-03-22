@@ -1,5 +1,6 @@
 mod backend;
 mod color;
+mod pager;
 mod rage;
 mod render;
 mod terminal_palette;
@@ -43,18 +44,19 @@ fn run() -> Result<i32> {
     }
 
     let render_mode = render::RenderMode::detect();
-    if render_mode.side_by_side {
+    let rendered = if render_mode.side_by_side {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let document = unified_diff::parse(&stdout);
         let palette = render::TintPalette::detect();
-        let rendered = render::render_document(&document, render_mode.width, &palette);
+        render::render_document(&document, render_mode.width, &palette)
+    } else {
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    if !pager::maybe_page(&rendered)? {
         io::stdout()
             .write_all(rendered.as_bytes())
             .context("failed to write rendered diff")?;
-    } else {
-        io::stdout()
-            .write_all(&output.stdout)
-            .context("failed to write backend stdout")?;
     }
 
     io::stdout().flush().context("failed to flush stdout")?;

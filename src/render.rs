@@ -1,6 +1,7 @@
 use crate::terminal_palette::AnsiColor;
 use crate::terminal_palette::user_message_bg;
 use crate::unified_diff::Document;
+use crate::unified_diff::Hunk;
 use crate::unified_diff::Item;
 use crate::unified_diff::Row;
 use crossterm::terminal;
@@ -10,8 +11,9 @@ use std::io::IsTerminal;
 use unicode_width::UnicodeWidthChar;
 
 const THRESHOLD_WIDTH: usize = 120;
-const GUTTER: &str = " | ";
+const PANE_GAP: &str = "  ";
 const TAB_STOP: usize = 8;
+const MIN_LINE_NUMBER_WIDTH: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RenderMode {
@@ -65,38 +67,71 @@ struct StyledLine {
     background: Option<AnsiColor>,
 }
 
-pub fn render_document(document: &Document, width: usize, palette: &TintPalette) -> String {
-    if width <= GUTTER.len() {
-        return String::new();
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Layout {
+    line_number_width: usize,
+    left_text_width: usize,
+    right_text_width: usize,
+}
 
-    let left_width = (width.saturating_sub(GUTTER.len())) / 2;
-    let right_width = width.saturating_sub(GUTTER.len() + left_width);
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RenderedRow {
+    SideBySide {
+        left_number: Option<usize>,
+        left_text: String,
+        right_number: Option<usize>,
+        right_line: StyledLine,
+    },
+    FullWidth(String),
+}
+
+pub fn render_document(document: &Document, width: usize, palette: &TintPalette) -> String {
+    let layout = layout_for(document, width);
     let mut output = String::new();
+    let mut previous_was_file_header = false;
 
     for item in &document.items {
         match item {
+            Item::FileHeader(path) => {
+                if !output.is_empty() && !previous_was_file_header {
+                    output.push('\n');
+                }
+                output.push_str(&render_file_header(path, width));
+                output.push('\n');
+                previous_was_file_header = true;
+            }
             Item::Meta(line) => {
                 output.push_str(&clip_plain_text(line, width));
                 output.push('\n');
+                previous_was_file_header = false;
             }
             Item::Hunk(hunk) => {
                 output.push_str(&clip_plain_text(&hunk.header, width));
                 output.push('\n');
 
-                for row in &hunk.rows {
-                    if let Row::Annotation(text) = row {
-                        output.push_str(&clip_plain_text(text, width));
-                        output.push('\n');
-                        continue;
-                    }
+                let mut old_line = hunk.old_start;
+                let mut new_line = hunk.new_start;
 
-                    let (left, right) = render_row(row, palette);
-                    output.push_str(&render_plain_cell(&left, left_width));
-                    output.push_str(GUTTER);
-                    output.push_str(&render_styled_cell(&right, right_width));
-                    output.push('\n');
+                for row in &hunk.rows {
+                    match render_row(row, &mut old_line, &mut new_line, palette) {
+                        RenderedRow::SideBySide {
+                            left_number,
+                            left_text,
+                            right_number,
+                            right_line,
+                        } => {
+                            output.push_str(&render_plain_cell(left_number, &left_text, layout));
+                            output.push_str(PANE_GAP);
+                            output.push_str(&render_styled_cell(right_number, &right_line, layout));
+                            output.push('\n');
+                        }
+                        RenderedRow::FullWidth(text) => {
+                            output.push_str(&clip_plain_text(&text, width));
+                            output.push('\n');
+                        }
+                    }
                 }
+                previous_was_file_header = false;
             }
         }
     }
@@ -104,43 +139,143 @@ pub fn render_document(document: &Document, width: usize, palette: &TintPalette)
     output
 }
 
-fn render_row(row: &Row, palette: &TintPalette) -> (String, StyledLine) {
+fn layout_for(document: &Document, width: usize) -> Layout {
+    let max_line = document
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Hunk(hunk) => Some(max_hunk_line(hunk)),
+            Item::FileHeader(_) | Item::Meta(_) => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let line_number_width = MIN_LINE_NUMBER_WIDTH.max(digit_count(max_line));
+    let reserved = line_number_width * 2 + 2 + PANE_GAP.len();
+    let text_space = width.saturating_sub(reserved);
+    let left_text_width = text_space / 2;
+    let right_text_width = text_space.saturating_sub(left_text_width);
+
+    Layout {
+        line_number_width,
+        left_text_width,
+        right_text_width,
+    }
+}
+
+fn max_hunk_line(hunk: &Hunk) -> usize {
+    let mut old_line = hunk.old_start;
+    let mut new_line = hunk.new_start;
+    let mut max_line = old_line.max(new_line);
+
+    for row in &hunk.rows {
+        match row {
+            Row::Context(_) => {
+                max_line = max_line.max(old_line).max(new_line);
+                old_line += 1;
+                new_line += 1;
+            }
+            Row::Delete(_) => {
+                max_line = max_line.max(old_line);
+                old_line += 1;
+            }
+            Row::Insert(_) => {
+                max_line = max_line.max(new_line);
+                new_line += 1;
+            }
+            Row::Change { .. } => {
+                max_line = max_line.max(old_line).max(new_line);
+                old_line += 1;
+                new_line += 1;
+            }
+            Row::Annotation(_) => {}
+        }
+    }
+
+    max_line
+}
+
+fn render_file_header(path: &str, width: usize) -> String {
+    let plain_width = display_width(path);
+    let fill_width = width.saturating_sub(plain_width + 1);
+    let fill = "-".repeat(fill_width);
+    format!("\u{1b}[1m{path}\u{1b}[0m {fill}")
+}
+
+fn render_row(
+    row: &Row,
+    old_line: &mut usize,
+    new_line: &mut usize,
+    palette: &TintPalette,
+) -> RenderedRow {
     match row {
         Row::Context(text) => {
-            let text = expand_tabs(text);
-            (
-                text.clone(),
-                StyledLine {
-                    segments: vec![Segment { text, dim: true }],
+            let line = expand_tabs(text);
+            let left_number = *old_line;
+            let right_number = *new_line;
+            *old_line += 1;
+            *new_line += 1;
+
+            RenderedRow::SideBySide {
+                left_number: Some(left_number),
+                left_text: line.clone(),
+                right_number: Some(right_number),
+                right_line: StyledLine {
+                    segments: vec![Segment {
+                        text: line,
+                        dim: true,
+                    }],
                     background: None,
                 },
-            )
+            }
         }
-        Row::Delete(text) => (expand_tabs(text), StyledLine::default()),
+        Row::Delete(text) => {
+            let left_number = *old_line;
+            *old_line += 1;
+
+            RenderedRow::SideBySide {
+                left_number: Some(left_number),
+                left_text: expand_tabs(text),
+                right_number: None,
+                right_line: StyledLine::default(),
+            }
+        }
         Row::Insert(text) => {
-            let text = expand_tabs(text);
-            (
-                String::new(),
-                StyledLine {
-                    segments: vec![Segment { text, dim: false }],
+            let right_number = *new_line;
+            *new_line += 1;
+
+            RenderedRow::SideBySide {
+                left_number: None,
+                left_text: String::new(),
+                right_number: Some(right_number),
+                right_line: StyledLine {
+                    segments: vec![Segment {
+                        text: expand_tabs(text),
+                        dim: false,
+                    }],
                     background: palette.changed_line_bg,
                 },
-            )
+            }
         }
         Row::Change { old, new } => {
+            let left_number = *old_line;
+            let right_number = *new_line;
+            *old_line += 1;
+            *new_line += 1;
+
             let old_text = expand_tabs(old);
             let new_text = expand_tabs(new);
-            let segments = diff_segments(&old_text, &new_text);
 
-            (
-                old_text,
-                StyledLine {
-                    segments,
+            RenderedRow::SideBySide {
+                left_number: Some(left_number),
+                left_text: old_text.clone(),
+                right_number: Some(right_number),
+                right_line: StyledLine {
+                    segments: diff_segments(&old_text, &new_text),
                     background: palette.changed_line_bg,
                 },
-            )
+            }
         }
-        Row::Annotation(_) => (String::new(), StyledLine::default()),
+        Row::Annotation(text) => RenderedRow::FullWidth(text.clone()),
     }
 }
 
@@ -149,15 +284,10 @@ fn diff_segments(old: &str, new: &str) -> Vec<Segment> {
     let mut segments = Vec::new();
 
     for change in diff.iter_all_changes() {
+        let value = change.value().to_string();
         match change.tag() {
-            ChangeTag::Equal => segments.push(Segment {
-                text: change.to_string(),
-                dim: true,
-            }),
-            ChangeTag::Insert => segments.push(Segment {
-                text: change.to_string(),
-                dim: false,
-            }),
+            ChangeTag::Equal => push_segment(&mut segments, value, true),
+            ChangeTag::Insert => push_segment(&mut segments, value, false),
             ChangeTag::Delete => {}
         }
     }
@@ -172,22 +302,47 @@ fn diff_segments(old: &str, new: &str) -> Vec<Segment> {
     segments
 }
 
-fn render_plain_cell(text: &str, width: usize) -> String {
-    let clipped = clip_plain_text(text, width);
-    let pad = width.saturating_sub(display_width(&clipped));
-    format!("{clipped}{}", " ".repeat(pad))
+fn push_segment(segments: &mut Vec<Segment>, text: String, dim: bool) {
+    if text.is_empty() {
+        return;
+    }
+
+    if let Some(last) = segments.last_mut()
+        && last.dim == dim
+    {
+        last.text.push_str(&text);
+        return;
+    }
+
+    segments.push(Segment { text, dim });
 }
 
-fn render_styled_cell(line: &StyledLine, width: usize) -> String {
-    let mut output = String::new();
-    let mut used = 0usize;
+fn render_plain_cell(number: Option<usize>, text: &str, layout: Layout) -> String {
+    let prefix = render_line_number(number, layout.line_number_width);
+    let clipped = clip_plain_text(text, layout.left_text_width);
+    let pad = layout.left_text_width.saturating_sub(display_width(&clipped));
+    format!("{prefix}{clipped}{}", " ".repeat(pad))
+}
 
+fn render_styled_cell(number: Option<usize>, line: &StyledLine, layout: Layout) -> String {
+    let mut output = String::new();
+    let prefix = render_line_number(number, layout.line_number_width);
+    let prefix_style = ansi_style(line.background, line.background.is_none());
+    if !prefix_style.is_empty() {
+        output.push_str(&prefix_style);
+        output.push_str(&prefix);
+        output.push_str("\u{1b}[0m");
+    } else {
+        output.push_str(&prefix);
+    }
+
+    let mut used = 0usize;
     for segment in &line.segments {
-        if used >= width {
+        if used >= layout.right_text_width {
             break;
         }
 
-        let visible = clip_plain_text(&segment.text, width - used);
+        let visible = clip_plain_text(&segment.text, layout.right_text_width - used);
         if visible.is_empty() {
             continue;
         }
@@ -204,17 +359,25 @@ fn render_styled_cell(line: &StyledLine, width: usize) -> String {
         used += display_width(&visible);
     }
 
-    if used < width {
+    if used < layout.right_text_width {
         if let Some(color) = line.background {
             output.push_str(&ansi_style(Some(color), false));
-            output.push_str(&" ".repeat(width - used));
+            output.push_str(&" ".repeat(layout.right_text_width - used));
             output.push_str("\u{1b}[0m");
         } else {
-            output.push_str(&" ".repeat(width - used));
+            output.push_str(&" ".repeat(layout.right_text_width - used));
         }
     }
 
     output
+}
+
+fn render_line_number(number: Option<usize>, width: usize) -> String {
+    let content = match number {
+        Some(number) => format!("{number:>width$}", width = width),
+        None => " ".repeat(width),
+    };
+    format!("{content} ")
 }
 
 fn ansi_style(background: Option<AnsiColor>, dim: bool) -> String {
@@ -280,6 +443,10 @@ fn display_width(text: &str) -> usize {
     width
 }
 
+fn digit_count(value: usize) -> usize {
+    value.max(1).to_string().len()
+}
+
 fn char_width(ch: char) -> usize {
     if ch == '\t' {
         TAB_STOP
@@ -295,6 +462,7 @@ mod tests {
     use super::StyledLine;
     use super::TintPalette;
     use super::display_width;
+    use super::diff_segments;
     use super::expand_tabs;
     use super::render_document;
     use crate::terminal_palette::AnsiColor;
@@ -316,21 +484,28 @@ mod tests {
     #[test]
     fn renders_changed_rows_with_background_escape() {
         let document = Document {
-            items: vec![Item::Hunk(Hunk {
-                header: "@@ -1 +1 @@".into(),
-                rows: vec![Row::Change {
-                    old: "cat".into(),
-                    new: "cot".into(),
-                }],
-            })],
+            items: vec![
+                Item::FileHeader("demo.txt".into()),
+                Item::Hunk(Hunk {
+                    header: "@@ -1 +1 @@".into(),
+                    old_start: 1,
+                    new_start: 1,
+                    rows: vec![Row::Change {
+                        old: "cat".into(),
+                        new: "cot".into(),
+                    }],
+                }),
+            ],
         };
         let palette = TintPalette {
             changed_line_bg: Some(AnsiColor::Indexed(240)),
         };
 
         let rendered = render_document(&document, 140, &palette);
+        assert!(rendered.contains("\u{1b}[1mdemo.txt\u{1b}[0m"));
         assert!(rendered.contains("\u{1b}[48;5;240m"));
         assert!(rendered.contains("\u{1b}[2;48;5;240m"));
+        assert!(!rendered.contains(" | "));
         assert!(!rendered.contains("+ cot"));
     }
 
@@ -354,5 +529,17 @@ mod tests {
         };
 
         assert_eq!(line.segments.len(), 1);
+    }
+
+    #[test]
+    fn merges_adjacent_diff_runs() {
+        let segments = diff_segments("    if render_mode.side_by_side {", "    let rendered = if render_mode.side_by_side {");
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].text, "    ");
+        assert!(segments[0].dim);
+        assert_eq!(segments[1].text, "let rendered = ");
+        assert!(!segments[1].dim);
+        assert_eq!(segments[2].text, "if render_mode.side_by_side {");
+        assert!(segments[2].dim);
     }
 }

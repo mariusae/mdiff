@@ -5,6 +5,7 @@ pub struct Document {
 
 #[derive(Debug)]
 pub enum Item {
+    FileHeader(String),
     Meta(String),
     Hunk(Hunk),
 }
@@ -12,6 +13,8 @@ pub enum Item {
 #[derive(Debug)]
 pub struct Hunk {
     pub header: String,
+    pub old_start: usize,
+    pub new_start: usize,
     pub rows: Vec<Row>,
 }
 
@@ -37,6 +40,12 @@ pub fn parse(input: &str) -> Document {
     let mut raw_rows: Vec<RawRow> = Vec::new();
 
     for line in input.lines() {
+        if let Some(path) = parse_file_header(line) {
+            flush_hunk(&mut items, &mut current_header, &mut raw_rows);
+            items.push(Item::FileHeader(path));
+            continue;
+        }
+
         if line.starts_with("@@") {
             flush_hunk(&mut items, &mut current_header, &mut raw_rows);
             current_header = Some(line.to_owned());
@@ -67,6 +76,10 @@ pub fn parse(input: &str) -> Document {
             }
         }
 
+        if is_redundant_path_meta(line) {
+            continue;
+        }
+
         items.push(Item::Meta(line.to_owned()));
     }
 
@@ -75,14 +88,64 @@ pub fn parse(input: &str) -> Document {
     Document { items }
 }
 
+fn parse_file_header(line: &str) -> Option<String> {
+    if let Some(rest) = line.strip_prefix("diff --git ") {
+        let mut parts = rest.split_whitespace();
+        let _old = parts.next()?;
+        let new = parts.next()?;
+        return Some(strip_diff_path_prefix(new));
+    }
+
+    if let Some(rest) = line.strip_prefix("diff -r ") {
+        let path = rest.split_whitespace().last()?;
+        return Some(strip_diff_path_prefix(path));
+    }
+
+    None
+}
+
+fn strip_diff_path_prefix(path: &str) -> String {
+    let trimmed = path.trim_matches('"');
+    trimmed
+        .strip_prefix("a/")
+        .or_else(|| trimmed.strip_prefix("b/"))
+        .unwrap_or(trimmed)
+        .to_owned()
+}
+
+fn is_redundant_path_meta(line: &str) -> bool {
+    line.starts_with("--- ") || line.starts_with("+++ ")
+}
+
 fn flush_hunk(items: &mut Vec<Item>, header: &mut Option<String>, raw_rows: &mut Vec<RawRow>) {
     let Some(header) = header.take() else {
         raw_rows.clear();
         return;
     };
 
+    let (old_start, new_start) = parse_hunk_header(&header).unwrap_or((0, 0));
     let rows = build_rows(std::mem::take(raw_rows));
-    items.push(Item::Hunk(Hunk { header, rows }));
+    items.push(Item::Hunk(Hunk {
+        header,
+        old_start,
+        new_start,
+        rows,
+    }));
+}
+
+fn parse_hunk_header(header: &str) -> Option<(usize, usize)> {
+    let inner = header.strip_prefix("@@ ")?;
+    let inner = inner.split(" @@").next()?;
+    let mut parts = inner.split_whitespace();
+    let old = parts.next()?;
+    let new = parts.next()?;
+    Some((parse_range_start(old)?, parse_range_start(new)?))
+}
+
+fn parse_range_start(value: &str) -> Option<usize> {
+    let value = value.strip_prefix(['-', '+'])?;
+    let start = value.split(',').next()?;
+    start.parse().ok()
 }
 
 fn build_rows(raw_rows: Vec<RawRow>) -> Vec<Row> {
@@ -146,11 +209,14 @@ diff --git a/a.txt b/a.txt
 
         let doc = parse(input);
         assert_eq!(doc.items.len(), 2);
+        assert!(matches!(&doc.items[0], Item::FileHeader(name) if name == "a.txt"));
 
         let Item::Hunk(hunk) = &doc.items[1] else {
             panic!("expected hunk");
         };
 
+        assert_eq!(hunk.old_start, 1);
+        assert_eq!(hunk.new_start, 1);
         assert_eq!(
             hunk.rows,
             vec![
@@ -187,5 +253,21 @@ diff --git a/a.txt b/a.txt
                 Row::Annotation("\\ No newline at end of file".into()),
             ]
         );
+    }
+
+    #[test]
+    fn parses_mercurial_file_headers() {
+        let input = "\
+diff -r 1234abcd -r abcd1234 path/to/demo.txt
+@@ -3 +3 @@
+-before
++after
+";
+
+        let doc = parse(input);
+        assert!(matches!(
+            &doc.items[0],
+            Item::FileHeader(name) if name == "path/to/demo.txt"
+        ));
     }
 }
