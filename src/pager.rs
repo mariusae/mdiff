@@ -1,10 +1,13 @@
+use crate::render::TintPalette;
 use crate::terminal_palette::AnsiColor;
 use crate::terminal_palette::search_highlight_bg;
 use anyhow::Context;
 use anyhow::Result;
 use crossterm::cursor;
 use crossterm::event;
+use crossterm::event::DisableFocusChange;
 use crossterm::event::DisableMouseCapture;
+use crossterm::event::EnableFocusChange;
 use crossterm::event::EnableMouseCapture;
 use crossterm::event::Event;
 use crossterm::event::KeyCode;
@@ -109,22 +112,24 @@ struct FileHeaderLine {
 
 pub fn page_or_render<F>(files: Vec<String>, render: F) -> Result<Option<String>>
 where
-    F: Fn(usize, &str) -> String,
+    F: Fn(usize, &str, &TintPalette) -> String,
 {
+    let palette = TintPalette::detect();
+
     if !std::io::stdout().is_terminal() {
-        return Ok(Some(render(0, "")));
+        return Ok(Some(render(0, "", &palette)));
     }
 
     let (width, rows) = terminal::size().context("failed to read terminal size")?;
     let width = width as usize;
     let rows = rows as usize;
-    let initial_output = render(width, "");
+    let initial_output = render(width, "", &palette);
 
     if line_count(&initial_output) <= rows {
         return Ok(Some(initial_output));
     }
 
-    page(files, render, width, rows, initial_output)?;
+    page(files, render, width, rows, initial_output, palette)?;
     Ok(None)
 }
 
@@ -134,18 +139,27 @@ fn page<F>(
     width: usize,
     height: usize,
     initial_output: String,
+    initial_palette: TintPalette,
 ) -> Result<()>
 where
-    F: Fn(usize, &str) -> String,
+    F: Fn(usize, &str, &TintPalette) -> String,
 {
     let mut stdout = io::stdout();
-    let mut state = PagerState::new(render, width, height, initial_output, files);
+    let mut state = PagerState::new(
+        render,
+        width,
+        height,
+        initial_output,
+        files,
+        initial_palette,
+    );
 
     terminal::enable_raw_mode().context("failed to enable raw mode")?;
     execute!(
         stdout,
         EnterAlternateScreen,
         EnableMouseCapture,
+        EnableFocusChange,
         cursor::Hide
     )
     .context("failed to initialize pager screen")?;
@@ -155,6 +169,7 @@ where
     execute!(
         stdout,
         cursor::Show,
+        DisableFocusChange,
         DisableMouseCapture,
         LeaveAlternateScreen
     )
@@ -166,7 +181,7 @@ where
 
 fn run_pager<F>(stdout: &mut io::Stdout, state: &mut PagerState<F>) -> Result<()>
 where
-    F: Fn(usize, &str) -> String,
+    F: Fn(usize, &str, &TintPalette) -> String,
 {
     loop {
         state.refresh_dimensions()?;
@@ -201,6 +216,8 @@ where
                     _ => {}
                 }
             }
+            Event::FocusGained => state.refresh_palette_from_terminal(),
+            Event::FocusLost => {}
             Event::Resize(_, _) => {}
             _ => {}
         }
@@ -209,7 +226,7 @@ where
 
 fn draw<F>(stdout: &mut io::Stdout, state: &PagerState<F>) -> Result<()>
 where
-    F: Fn(usize, &str) -> String,
+    F: Fn(usize, &str, &TintPalette) -> String,
 {
     let hud_lines = state.hud_lines();
     let viewport_height = state.height.saturating_sub(hud_lines.len());
@@ -659,9 +676,10 @@ fn char_width(ch: char) -> usize {
 #[derive(Debug)]
 struct PagerState<F>
 where
-    F: Fn(usize, &str) -> String,
+    F: Fn(usize, &str, &TintPalette) -> String,
 {
     render: F,
+    palette: TintPalette,
     lines: Vec<String>,
     plain_lines: Vec<String>,
     offset: usize,
@@ -681,7 +699,7 @@ where
 
 impl<F> PagerState<F>
 where
-    F: Fn(usize, &str) -> String,
+    F: Fn(usize, &str, &TintPalette) -> String,
 {
     fn new(
         render: F,
@@ -689,6 +707,7 @@ where
         height: usize,
         initial_output: String,
         all_files: Vec<String>,
+        palette: TintPalette,
     ) -> Self {
         let lines: Vec<String> = initial_output.lines().map(str::to_owned).collect();
         let plain_lines = rebuild_plain_lines(&lines);
@@ -697,6 +716,7 @@ where
 
         Self {
             render,
+            palette,
             lines,
             plain_lines,
             offset: 0,
@@ -735,7 +755,7 @@ where
     }
 
     fn rerender(&mut self, preferred_file: Option<String>) {
-        let output = (self.render)(self.width, &self.file_filter_query);
+        let output = (self.render)(self.width, &self.file_filter_query, &self.palette);
         self.lines = output.lines().map(str::to_owned).collect();
         self.plain_lines = rebuild_plain_lines(&self.lines);
         self.visible_files = filter_file_names(&self.all_files, &self.file_filter_query);
@@ -831,6 +851,21 @@ where
     fn clamp_offset(&mut self) {
         self.offset = self.offset.min(self.max_offset());
         self.horizontal_offset = self.horizontal_offset.min(self.max_horizontal_offset());
+    }
+
+    fn refresh_palette_from_terminal(&mut self) {
+        self.apply_palette(TintPalette::detect(), search_highlight_bg());
+    }
+
+    fn apply_palette(&mut self, palette: TintPalette, search_bg: Option<AnsiColor>) {
+        if self.palette == palette && self.search_bg == search_bg {
+            return;
+        }
+
+        let preferred = self.current_top_file_name();
+        self.palette = palette;
+        self.search_bg = search_bg;
+        self.rerender(preferred);
     }
 
     fn scroll_left(&mut self) {
@@ -1358,6 +1393,7 @@ mod tests {
     use super::render_highlighted_line;
     use super::render_search_hud;
     use super::strip_ansi_text;
+    use crate::render::TintPalette;
     use crate::terminal_palette::AnsiColor;
     use crossterm::event::KeyCode;
     use crossterm::event::KeyModifiers;
@@ -1384,11 +1420,12 @@ mod tests {
     #[test]
     fn pager_page_movement_is_page_sized() {
         let mut state = PagerState::new(
-            |_, _| "1\n2\n3\n4\n5\n6\n7\n8\n9\n10".into(),
+            |_, _, _| "1\n2\n3\n4\n5\n6\n7\n8\n9\n10".into(),
             80,
             3,
             "1\n2\n3\n4\n5\n6\n7\n8\n9\n10".into(),
             Vec::new(),
+            TintPalette::default(),
         );
         state.page_down();
         assert_eq!(state.offset, 3);
@@ -1399,11 +1436,12 @@ mod tests {
     #[test]
     fn pager_scroll_is_line_sized() {
         let mut state = PagerState::new(
-            |_, _| "1\n2\n3\n4\n5".into(),
+            |_, _, _| "1\n2\n3\n4\n5".into(),
             80,
             2,
             "1\n2\n3\n4\n5".into(),
             Vec::new(),
+            TintPalette::default(),
         );
         state.scroll_down(3);
         assert_eq!(state.offset, 3);
@@ -1414,11 +1452,12 @@ mod tests {
     #[test]
     fn rerenders_when_width_changes() {
         let mut state = PagerState::new(
-            |width, _| format!("width={width}"),
+            |width, _, _| format!("width={width}"),
             80,
             10,
             "width=80".into(),
             Vec::new(),
+            TintPalette::default(),
         );
         assert_eq!(state.line_at(0), Some("width=80"));
 
@@ -1431,11 +1470,12 @@ mod tests {
     fn horizontal_scroll_is_clamped_to_widest_displayed_line() {
         let line = "this is a very long line";
         let mut state = PagerState::new(
-            |_, _| format!("short\n{line}"),
+            |_, _, _| format!("short\n{line}"),
             10,
             4,
             format!("short\n{line}"),
             Vec::new(),
+            TintPalette::default(),
         );
 
         state.scroll_right();
@@ -1467,11 +1507,12 @@ mod tests {
     #[test]
     fn search_matches_rendered_text_without_ansi() {
         let mut state = PagerState::new(
-            |_, _| "\u{1b}[1malpha\u{1b}[0m\nbeta".into(),
+            |_, _, _| "\u{1b}[1malpha\u{1b}[0m\nbeta".into(),
             80,
             4,
             "\u{1b}[1malpha\u{1b}[0m\nbeta".into(),
             Vec::new(),
+            TintPalette::default(),
         );
 
         assert!(state.handle_hud_key(KeyCode::Char('/'), KeyModifiers::NONE));
@@ -1512,11 +1553,12 @@ mod tests {
     #[test]
     fn active_search_reserves_bottom_row_for_hud() {
         let mut state = PagerState::new(
-            |_, _| "a\nb\nc\nd".into(),
+            |_, _, _| "a\nb\nc\nd".into(),
             80,
             4,
             "a\nb\nc\nd".into(),
             Vec::new(),
+            TintPalette::default(),
         );
         assert!(state.handle_hud_key(KeyCode::Char('/'), KeyModifiers::NONE));
         assert!(state.handle_hud_key(KeyCode::Char('b'), KeyModifiers::NONE));
@@ -1528,11 +1570,12 @@ mod tests {
     #[test]
     fn search_navigation_stops_at_edges_and_reports_boundary() {
         let mut state = PagerState::new(
-            |_, _| "alpha\nbeta alpha\ngamma alpha".into(),
+            |_, _, _| "alpha\nbeta alpha\ngamma alpha".into(),
             80,
             3,
             "alpha\nbeta alpha\ngamma alpha".into(),
             Vec::new(),
+            TintPalette::default(),
         );
         assert!(state.handle_hud_key(KeyCode::Char('/'), KeyModifiers::NONE));
         assert!(state.handle_hud_key(KeyCode::Char('a'), KeyModifiers::NONE));
@@ -1575,7 +1618,7 @@ mod tests {
     fn file_filter_narrows_files_and_rerenders_output() {
         let files = vec!["a.go".into(), "b.rs".into(), "c.go".into()];
         let mut state = PagerState::new(
-            |_, filter| {
+            |_, filter, _| {
                 if filter.is_empty() {
                     "a.go\nbody\nb.rs\nbody\nc.go\nbody".into()
                 } else {
@@ -1586,6 +1629,7 @@ mod tests {
             10,
             "a.go\nbody\nb.rs\nbody\nc.go\nbody".into(),
             files,
+            TintPalette::default(),
         );
 
         assert!(state.handle_hud_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
@@ -1606,7 +1650,14 @@ mod tests {
         let files = vec!["file1".into(), "file2".into()];
         let initial = "\u{1b}[1mfile1\u{1b}[0m\nx\n\u{1b}[1mfile2\u{1b}[0m\ny".to_owned();
         let rendered = initial.clone();
-        let mut state = PagerState::new(|_, _| rendered.clone(), 80, 6, initial, files);
+        let mut state = PagerState::new(
+            |_, _, _| rendered.clone(),
+            80,
+            6,
+            initial,
+            files,
+            TintPalette::default(),
+        );
         assert!(state.handle_hud_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
         state.navigate_next_file();
 
@@ -1620,12 +1671,40 @@ mod tests {
         let files = vec!["file1".into(), "file2".into()];
         let initial = "file1\nx\nfile2\ny".to_owned();
         let rendered = initial.clone();
-        let mut state = PagerState::new(|_, _| rendered.clone(), 80, 6, initial, files);
+        let mut state = PagerState::new(
+            |_, _, _| rendered.clone(),
+            80,
+            6,
+            initial,
+            files,
+            TintPalette::default(),
+        );
         assert!(state.handle_hud_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
         assert!(state.handle_hud_key(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(state.current_top_file_name().as_deref(), Some("file2"));
         assert!(state.handle_hud_key(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(state.current_top_file_name().as_deref(), Some("file1"));
+    }
+
+    #[test]
+    fn applying_new_palette_rerenders_output() {
+        let mut state = PagerState::new(
+            |_, _, palette| format!("{:?}", palette.changed_line_bg),
+            80,
+            4,
+            "None".into(),
+            Vec::new(),
+            TintPalette::default(),
+        );
+
+        state.apply_palette(
+            TintPalette {
+                changed_line_bg: Some(AnsiColor::Indexed(240)),
+            },
+            None,
+        );
+
+        assert_eq!(state.line_at(0), Some("Some(Indexed(240))"));
     }
 
     #[test]
@@ -1653,11 +1732,12 @@ mod tests {
     #[test]
     fn question_mark_toggles_help_overlay() {
         let mut state = PagerState::new(
-            |_, _| "file1\nbody".into(),
+            |_, _, _| "file1\nbody".into(),
             80,
             10,
             "file1\nbody".into(),
             Vec::new(),
+            TintPalette::default(),
         );
         assert!(state.handle_hud_key(KeyCode::Char('?'), KeyModifiers::NONE));
         assert!(state.help_open);

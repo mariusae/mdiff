@@ -46,14 +46,12 @@ fn run() -> Result<i32> {
     let raw_stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let document = unified_diff::parse(&raw_stdout);
     let files = document.file_paths();
-    let palette = render::TintPalette::detect();
-
-    let rendered = pager::page_or_render(files, |width, file_filter| {
+    let rendered = pager::page_or_render(files, |width, file_filter, palette| {
         let filtered = document.filter_files(file_filter);
         if render::should_render_side_by_side(width) {
-            render::render_document(&filtered, width, &palette)
+            render::render_document(&filtered, width, palette)
         } else {
-            render::render_inline_document(&filtered, width, &palette)
+            render::render_inline_document(&filtered, width, palette)
         }
     })?;
 
