@@ -506,6 +506,7 @@ where
     height: usize,
     search: SearchMode,
     search_bg: Option<AnsiColor>,
+    search_message: Option<&'static str>,
 }
 
 impl<F> PagerState<F>
@@ -524,6 +525,7 @@ where
             height,
             search: SearchMode::Inactive,
             search_bg: search_highlight_bg(),
+            search_message: None,
         }
     }
 
@@ -619,15 +621,18 @@ where
                 self.search = SearchMode::Prompt {
                     query: String::new(),
                 };
+                self.search_message = None;
                 true
             }
             (SearchMode::Prompt { .. }, KeyCode::Esc) => {
                 self.search = SearchMode::Inactive;
+                self.search_message = None;
                 self.clamp_offset();
                 true
             }
             (SearchMode::Prompt { query }, KeyCode::Backspace) => {
                 query.pop();
+                self.search_message = None;
                 true
             }
             (SearchMode::Prompt { .. }, KeyCode::Enter) => {
@@ -636,16 +641,19 @@ where
             }
             (SearchMode::Prompt { query }, KeyCode::Char(ch)) => {
                 query.push(ch);
+                self.search_message = None;
                 true
             }
             (SearchMode::Active { .. }, KeyCode::Esc) => {
                 self.search = SearchMode::Inactive;
+                self.search_message = None;
                 self.clamp_offset();
                 true
             }
             (SearchMode::Active { .. }, KeyCode::Char('/')) => {
                 let query = self.search_query().unwrap_or_default();
                 self.search = SearchMode::Prompt { query };
+                self.search_message = None;
                 true
             }
             (SearchMode::Active { .. }, KeyCode::Char('n')) => {
@@ -667,6 +675,7 @@ where
 
         if query.is_empty() {
             self.search = SearchMode::Inactive;
+            self.search_message = None;
             self.clamp_offset();
             return;
         }
@@ -678,6 +687,7 @@ where
             matches,
             current: 0,
         };
+        self.search_message = None;
         self.jump_to_current_match();
     }
 
@@ -704,6 +714,7 @@ where
             matches,
             current,
         };
+        self.search_message = None;
         self.jump_to_current_match();
     }
 
@@ -715,7 +726,12 @@ where
             if matches.is_empty() {
                 return;
             }
-            *current = (*current + 1) % matches.len();
+            if *current + 1 >= matches.len() {
+                self.search_message = Some("end of file");
+                return;
+            }
+            *current += 1;
+            self.search_message = None;
             self.jump_to_current_match();
         }
     }
@@ -728,11 +744,12 @@ where
             if matches.is_empty() {
                 return;
             }
-            *current = if *current == 0 {
-                matches.len() - 1
-            } else {
-                *current - 1
-            };
+            if *current == 0 {
+                self.search_message = Some("beginning of file");
+                return;
+            }
+            *current -= 1;
+            self.search_message = None;
             self.jump_to_current_match();
         }
     }
@@ -788,11 +805,15 @@ where
                 matches,
                 current,
             } => {
-                let status = if matches.is_empty() {
+                let mut status = if matches.is_empty() {
                     "0/0".to_owned()
                 } else {
                     format!("{}/{}", current + 1, matches.len())
                 };
+                if let Some(message) = self.search_message {
+                    status.push(' ');
+                    status.push_str(message);
+                }
                 Some(render_search_hud(
                     query,
                     self.width,
@@ -936,7 +957,7 @@ mod tests {
     }
 
     #[test]
-    fn search_navigation_cycles_matches() {
+    fn search_navigation_stops_at_edges_and_reports_boundary() {
         let mut state = PagerState::new(
             |_| "alpha\nbeta alpha\ngamma alpha".into(),
             80,
@@ -952,12 +973,32 @@ mod tests {
         assert!(state.handle_search_key(KeyCode::Enter));
 
         state.next_match();
+        state.next_match();
+        assert!(state.handle_search_key(KeyCode::Char('n')));
+
+        match &state.search {
+            SearchMode::Active { current, .. } => assert_eq!(*current, 2),
+            SearchMode::Inactive | SearchMode::Prompt { .. } => panic!("search not active"),
+        }
+        assert!(
+            state
+                .search_hud_line()
+                .is_some_and(|line| line.contains("end of file"))
+        );
+
+        assert!(state.handle_search_key(KeyCode::Char('N')));
+        assert!(state.handle_search_key(KeyCode::Char('N')));
         assert!(state.handle_search_key(KeyCode::Char('N')));
 
         match &state.search {
             SearchMode::Active { current, .. } => assert_eq!(*current, 0),
             SearchMode::Inactive | SearchMode::Prompt { .. } => panic!("search not active"),
         }
+        assert!(
+            state
+                .search_hud_line()
+                .is_some_and(|line| line.contains("beginning of file"))
+        );
     }
 
     #[test]
