@@ -338,7 +338,7 @@ fn render_file_section(
                                 &center_number,
                                 layout.center_number_width,
                             ));
-                            if right_gutter {
+                            if right_gutter && !right_line.text.is_empty() {
                                 if let Some(color) = palette.gutter_fg {
                                     output.push(' ');
                                     output.push_str(&ansi_bg(color));
@@ -571,11 +571,12 @@ fn render_inline_inserted_line(
     palette: &TintPalette,
 ) -> String {
     let prefix = format!("{line_number:>line_number_width$} ");
-    if let Some(color) = palette.gutter_fg {
-        format!("{prefix}{} \u{1b}[0m{}", ansi_bg(color), expand_tabs(text))
-    } else {
-        format!("{prefix}+{}", expand_tabs(text))
+    if !text.is_empty() {
+        if let Some(color) = palette.gutter_fg {
+            return format!("{prefix}{} \u{1b}[0m{}", ansi_bg(color), expand_tabs(text));
+        }
     }
+    format!("{prefix} {}", expand_tabs(text))
 }
 
 fn render_inline_changed_line(
