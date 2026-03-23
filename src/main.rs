@@ -48,11 +48,13 @@ fn run() -> Result<i32> {
     let files = document.file_paths();
     let rendered = pager::page_or_render(files, |width, file_filter, palette| {
         let filtered = document.filter_files(file_filter);
-        if render::should_render_side_by_side(width) {
+        let layout = render::pane_layout(&filtered, width);
+        let output = if render::should_render_side_by_side(width) {
             render::render_document(&filtered, width, palette)
         } else {
             render::render_inline_document(&filtered, width, palette)
-        }
+        };
+        (output, layout)
     })?;
 
     if let Some(rendered) = rendered {

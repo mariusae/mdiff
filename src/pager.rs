@@ -1,3 +1,4 @@
+use crate::render::PaneLayout;
 use crate::render::TintPalette;
 use crate::terminal_palette::AnsiColor;
 use crate::terminal_palette::search_highlight_bg;
@@ -12,6 +13,7 @@ use crossterm::event::EnableMouseCapture;
 use crossterm::event::Event;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyModifiers;
+use crossterm::event::MouseButton;
 use crossterm::event::MouseEventKind;
 use crossterm::execute;
 use crossterm::queue;
@@ -110,26 +112,41 @@ struct FileHeaderLine {
     line: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectionPane {
+    Left,
+    Right,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Selection {
+    pane: SelectionPane,
+    anchor_line: usize,
+    extent_line: usize,
+}
+
 pub fn page_or_render<F>(files: Vec<String>, render: F) -> Result<Option<String>>
 where
-    F: Fn(usize, &str, &TintPalette) -> String,
+    F: Fn(usize, &str, &TintPalette) -> (String, PaneLayout),
 {
     let palette = TintPalette::detect();
 
     if !std::io::stdout().is_terminal() {
-        return Ok(Some(render(0, "", &palette)));
+        let (output, _) = render(0, "", &palette);
+        return Ok(Some(output));
     }
 
     let (width, rows) = terminal::size().context("failed to read terminal size")?;
     let width = width as usize;
     let rows = rows as usize;
-    let initial_output = render(width, "", &palette);
+    let (initial_output, initial_layout) = render(width, "", &palette);
 
     if line_count(&initial_output) <= rows {
         return Ok(Some(initial_output));
     }
 
-    page(files, render, width, rows, initial_output, palette)?;
+    page(files, render, width, rows, initial_output, initial_layout, palette)?;
     Ok(None)
 }
 
@@ -139,10 +156,11 @@ fn page<F>(
     width: usize,
     height: usize,
     initial_output: String,
+    initial_layout: PaneLayout,
     initial_palette: TintPalette,
 ) -> Result<()>
 where
-    F: Fn(usize, &str, &TintPalette) -> String,
+    F: Fn(usize, &str, &TintPalette) -> (String, PaneLayout),
 {
     let mut stdout = io::stdout();
     let mut state = PagerState::new(
@@ -150,6 +168,7 @@ where
         width,
         height,
         initial_output,
+        initial_layout,
         files,
         initial_palette,
     );
@@ -181,7 +200,7 @@ where
 
 fn run_pager<F>(stdout: &mut io::Stdout, state: &mut PagerState<F>) -> Result<()>
 where
-    F: Fn(usize, &str, &TintPalette) -> String,
+    F: Fn(usize, &str, &TintPalette) -> (String, PaneLayout),
 {
     loop {
         state.refresh_dimensions()?;
@@ -189,6 +208,8 @@ where
 
         match event::read().context("failed to read pager input")? {
             Event::Key(key) => {
+                state.selection = None;
+
                 if state.handle_hud_key(key.code, key.modifiers) {
                     continue;
                 }
@@ -213,6 +234,40 @@ where
                 match mouse.kind {
                     MouseEventKind::ScrollUp => state.scroll_up(MOUSE_SCROLL_LINES),
                     MouseEventKind::ScrollDown => state.scroll_down(MOUSE_SCROLL_LINES),
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let row = mouse.row as usize;
+                        if row < state.viewport_height() {
+                            let line = state.offset + row;
+                            let content_col = state.horizontal_offset + mouse.column as usize;
+                            let pane = state.pane_at_column(content_col);
+                            state.selection = Some(Selection {
+                                pane,
+                                anchor_line: line,
+                                extent_line: line,
+                            });
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        let row = mouse.row as usize;
+                        let max_row = state.viewport_height().saturating_sub(1);
+                        let line = state.offset + row.min(max_row);
+                        if let Some(ref mut sel) = state.selection {
+                            sel.extent_line = line;
+                        }
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        let row = mouse.row as usize;
+                        let max_row = state.viewport_height().saturating_sub(1);
+                        let line = state.offset + row.min(max_row);
+                        if let Some(ref mut sel) = state.selection {
+                            sel.extent_line = line;
+                        }
+                        let text = state.extract_selection_text();
+                        state.selection = None;
+                        if !text.is_empty() {
+                            let _ = write_osc52(stdout, &text);
+                        }
+                    }
                     _ => continue,
                 }
             }
@@ -225,7 +280,7 @@ where
 
 fn draw<F>(stdout: &mut io::Stdout, state: &PagerState<F>) -> Result<()>
 where
-    F: Fn(usize, &str, &TintPalette) -> String,
+    F: Fn(usize, &str, &TintPalette) -> (String, PaneLayout),
 {
     let hud_lines = state.hud_lines();
     let viewport_height = state.height.saturating_sub(hud_lines.len());
@@ -278,7 +333,7 @@ fn clip_ansi_text(text: &str, width: usize) -> String {
 }
 
 fn clip_ansi_text_from(text: &str, start_col: usize, width: usize) -> String {
-    render_visible_cells(&parse_styled_cells(text), start_col, width, &[], None)
+    render_visible_cells(&parse_styled_cells(text), start_col, width, &[], None, None)
 }
 
 fn strip_ansi_text(text: &str) -> String {
@@ -411,6 +466,7 @@ fn render_highlighted_line(
     width: usize,
     matches: &[SearchMatch],
     search_bg: Option<AnsiColor>,
+    selection: Option<(usize, usize)>,
 ) -> String {
     render_visible_cells(
         &parse_styled_cells(text),
@@ -418,6 +474,7 @@ fn render_highlighted_line(
         width,
         matches,
         search_bg,
+        selection,
     )
 }
 
@@ -427,6 +484,7 @@ fn render_visible_cells(
     width: usize,
     matches: &[SearchMatch],
     search_bg: Option<AnsiColor>,
+    selection: Option<(usize, usize)>,
 ) -> String {
     if width == 0 {
         return String::new();
@@ -460,6 +518,11 @@ fn render_visible_cells(
         let mut style = cell.style;
         if search_bg.is_some() && cell_is_highlighted(&cell, matches) {
             style.background = search_bg;
+        }
+        if let (Some((sel_start, sel_end)), Some(bg)) = (selection, search_bg) {
+            if skipped >= sel_start && skipped < sel_end {
+                style.background = Some(bg);
+            }
         }
 
         if style != current_style {
@@ -675,7 +738,7 @@ fn char_width(ch: char) -> usize {
 #[derive(Debug)]
 struct PagerState<F>
 where
-    F: Fn(usize, &str, &TintPalette) -> String,
+    F: Fn(usize, &str, &TintPalette) -> (String, PaneLayout),
 {
     render: F,
     palette: TintPalette,
@@ -694,17 +757,20 @@ where
     file_filter_query: String,
     file_filter_open: bool,
     help_open: bool,
+    selection: Option<Selection>,
+    pane_layout: PaneLayout,
 }
 
 impl<F> PagerState<F>
 where
-    F: Fn(usize, &str, &TintPalette) -> String,
+    F: Fn(usize, &str, &TintPalette) -> (String, PaneLayout),
 {
     fn new(
         render: F,
         width: usize,
         height: usize,
         initial_output: String,
+        initial_layout: PaneLayout,
         all_files: Vec<String>,
         palette: TintPalette,
     ) -> Self {
@@ -731,6 +797,8 @@ where
             file_filter_query: String::new(),
             file_filter_open: false,
             help_open: false,
+            selection: None,
+            pane_layout: initial_layout,
         }
     }
 
@@ -754,7 +822,8 @@ where
     }
 
     fn rerender(&mut self, preferred_file: Option<String>) {
-        let output = (self.render)(self.width, &self.file_filter_query, &self.palette);
+        let (output, layout) = (self.render)(self.width, &self.file_filter_query, &self.palette);
+        self.pane_layout = layout;
         self.lines = output.lines().map(str::to_owned).collect();
         self.plain_lines = rebuild_plain_lines(&self.lines);
         self.visible_files = filter_file_names(&self.all_files, &self.file_filter_query);
@@ -793,12 +862,14 @@ where
         let line_index = self.offset + row;
         let line = self.lines.get(line_index)?;
         let matches = self.matches_for_line(line_index);
+        let selection = self.selection_columns_for_line(line_index);
         Some(render_highlighted_line(
             line,
             self.horizontal_offset,
             self.width,
             &matches,
             self.search_bg,
+            selection,
         ))
     }
 
@@ -1324,6 +1395,108 @@ where
             self.height.saturating_sub(1) as u16,
         ))
     }
+
+    fn pane_at_column(&self, content_col: usize) -> SelectionPane {
+        let layout = &self.pane_layout;
+        if layout.left_end == 0 {
+            SelectionPane::Full
+        } else if content_col < layout.left_end {
+            SelectionPane::Left
+        } else if content_col >= layout.right_start {
+            SelectionPane::Right
+        } else {
+            SelectionPane::Left
+        }
+    }
+
+    fn selection_columns_for_line(&self, line_index: usize) -> Option<(usize, usize)> {
+        let sel = self.selection.as_ref()?;
+        let start = sel.anchor_line.min(sel.extent_line);
+        let end = sel.anchor_line.max(sel.extent_line);
+        if line_index < start || line_index > end {
+            return None;
+        }
+        let layout = &self.pane_layout;
+        match sel.pane {
+            SelectionPane::Full => Some((layout.content_start, usize::MAX)),
+            SelectionPane::Left => Some((0, layout.left_end)),
+            SelectionPane::Right => Some((layout.right_start, usize::MAX)),
+        }
+    }
+
+    fn extract_selection_text(&self) -> String {
+        let Some(sel) = &self.selection else {
+            return String::new();
+        };
+        let start = sel.anchor_line.min(sel.extent_line);
+        let end = sel.anchor_line.max(sel.extent_line);
+        let layout = &self.pane_layout;
+        let (col_start, col_end) = match sel.pane {
+            SelectionPane::Full => (layout.content_start, usize::MAX),
+            SelectionPane::Left => (0, layout.left_end),
+            SelectionPane::Right => (layout.right_start, usize::MAX),
+        };
+
+        let mut lines = Vec::new();
+        for i in start..=end {
+            if let Some(line) = self.plain_lines.get(i) {
+                let extracted = extract_column_range(line, col_start, col_end);
+                lines.push(extracted.trim_end().to_owned());
+            }
+        }
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+}
+
+fn extract_column_range(text: &str, start_col: usize, end_col: usize) -> String {
+    let mut result = String::new();
+    let mut col = 0usize;
+    for ch in text.chars() {
+        let w = char_width(ch);
+        if col >= start_col && col + w <= end_col {
+            result.push(ch);
+        }
+        col += w;
+        if col >= end_col {
+            break;
+        }
+    }
+    result
+}
+
+fn encode_base64(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::new();
+    let mut i = 0;
+    while i < data.len() {
+        let b0 = data[i] as u32;
+        let b1 = if i + 1 < data.len() { data[i + 1] as u32 } else { 0 };
+        let b2 = if i + 2 < data.len() { data[i + 2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        result.push(CHARS[((triple >> 18) & 0x3f) as usize] as char);
+        result.push(CHARS[((triple >> 12) & 0x3f) as usize] as char);
+        if i + 1 < data.len() {
+            result.push(CHARS[((triple >> 6) & 0x3f) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if i + 2 < data.len() {
+            result.push(CHARS[(triple & 0x3f) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        i += 3;
+    }
+    result
+}
+
+fn write_osc52(stdout: &mut io::Stdout, text: &str) -> Result<()> {
+    let encoded = encode_base64(text.as_bytes());
+    write!(stdout, "\x1b]52;c;{encoded}\x07").context("failed to write OSC 52")?;
+    stdout.flush().context("failed to flush OSC 52")
 }
 
 fn render_centered_overlay_lines(
@@ -1386,16 +1559,23 @@ mod tests {
     use super::build_file_header_lines;
     use super::clip_ansi_text;
     use super::clip_ansi_text_from;
+    use super::encode_base64;
+    use super::extract_column_range;
     use super::filter_file_names;
     use super::find_matches;
     use super::render_centered_overlay_lines;
     use super::render_highlighted_line;
     use super::render_search_hud;
     use super::strip_ansi_text;
+    use crate::render::PaneLayout;
     use crate::render::TintPalette;
     use crate::terminal_palette::AnsiColor;
     use crossterm::event::KeyCode;
     use crossterm::event::KeyModifiers;
+
+    fn test_render(s: String) -> (String, PaneLayout) {
+        (s, PaneLayout::default())
+    }
 
     #[test]
     fn clip_ansi_text_preserves_escape_sequences() {
@@ -1419,10 +1599,11 @@ mod tests {
     #[test]
     fn pager_page_movement_is_page_sized() {
         let mut state = PagerState::new(
-            |_, _, _| "1\n2\n3\n4\n5\n6\n7\n8\n9\n10".into(),
+            |_, _, _| test_render("1\n2\n3\n4\n5\n6\n7\n8\n9\n10".into()),
             80,
             3,
             "1\n2\n3\n4\n5\n6\n7\n8\n9\n10".into(),
+            PaneLayout::default(),
             Vec::new(),
             TintPalette::default(),
         );
@@ -1435,10 +1616,11 @@ mod tests {
     #[test]
     fn pager_scroll_is_line_sized() {
         let mut state = PagerState::new(
-            |_, _, _| "1\n2\n3\n4\n5".into(),
+            |_, _, _| test_render("1\n2\n3\n4\n5".into()),
             80,
             2,
             "1\n2\n3\n4\n5".into(),
+            PaneLayout::default(),
             Vec::new(),
             TintPalette::default(),
         );
@@ -1451,10 +1633,11 @@ mod tests {
     #[test]
     fn rerenders_when_width_changes() {
         let mut state = PagerState::new(
-            |width, _, _| format!("width={width}"),
+            |width, _, _| test_render(format!("width={width}")),
             80,
             10,
             "width=80".into(),
+            PaneLayout::default(),
             Vec::new(),
             TintPalette::default(),
         );
@@ -1469,10 +1652,11 @@ mod tests {
     fn horizontal_scroll_is_clamped_to_widest_displayed_line() {
         let line = "this is a very long line";
         let mut state = PagerState::new(
-            |_, _, _| format!("short\n{line}"),
+            |_, _, _| test_render(format!("short\n{line}")),
             10,
             4,
             format!("short\n{line}"),
+            PaneLayout::default(),
             Vec::new(),
             TintPalette::default(),
         );
@@ -1506,10 +1690,11 @@ mod tests {
     #[test]
     fn search_matches_rendered_text_without_ansi() {
         let mut state = PagerState::new(
-            |_, _, _| "\u{1b}[1malpha\u{1b}[0m\nbeta".into(),
+            |_, _, _| test_render("\u{1b}[1malpha\u{1b}[0m\nbeta".into()),
             80,
             4,
             "\u{1b}[1malpha\u{1b}[0m\nbeta".into(),
+            PaneLayout::default(),
             Vec::new(),
             TintPalette::default(),
         );
@@ -1537,13 +1722,15 @@ mod tests {
                 end: 5,
             }],
             Some(AnsiColor::Indexed(240)),
+            None,
         );
         assert!(rendered.contains("\u{1b}[1;48;5;240m"));
     }
 
     #[test]
     fn tinted_lines_fill_to_edge_without_forcing_overflow_marker() {
-        let rendered = render_highlighted_line("\u{1b}[48;5;240mabc\u{1b}[0m", 0, 6, &[], None);
+        let rendered =
+            render_highlighted_line("\u{1b}[48;5;240mabc\u{1b}[0m", 0, 6, &[], None, None);
         assert!(rendered.contains("\u{1b}[48;5;240mabc"));
         assert!(rendered.contains("   \u{1b}[0m"));
         assert!(!rendered.contains('»'));
@@ -1552,10 +1739,11 @@ mod tests {
     #[test]
     fn active_search_reserves_bottom_row_for_hud() {
         let mut state = PagerState::new(
-            |_, _, _| "a\nb\nc\nd".into(),
+            |_, _, _| test_render("a\nb\nc\nd".into()),
             80,
             4,
             "a\nb\nc\nd".into(),
+            PaneLayout::default(),
             Vec::new(),
             TintPalette::default(),
         );
@@ -1569,10 +1757,11 @@ mod tests {
     #[test]
     fn search_navigation_stops_at_edges_and_reports_boundary() {
         let mut state = PagerState::new(
-            |_, _, _| "alpha\nbeta alpha\ngamma alpha".into(),
+            |_, _, _| test_render("alpha\nbeta alpha\ngamma alpha".into()),
             80,
             3,
             "alpha\nbeta alpha\ngamma alpha".into(),
+            PaneLayout::default(),
             Vec::new(),
             TintPalette::default(),
         );
@@ -1619,14 +1808,15 @@ mod tests {
         let mut state = PagerState::new(
             |_, filter, _| {
                 if filter.is_empty() {
-                    "a.go\nbody\nb.rs\nbody\nc.go\nbody".into()
+                    test_render("a.go\nbody\nb.rs\nbody\nc.go\nbody".into())
                 } else {
-                    format!("{filter}\nfiltered")
+                    test_render(format!("{filter}\nfiltered"))
                 }
             },
             80,
             10,
             "a.go\nbody\nb.rs\nbody\nc.go\nbody".into(),
+            PaneLayout::default(),
             files,
             TintPalette::default(),
         );
@@ -1650,10 +1840,11 @@ mod tests {
         let initial = "\u{1b}[1mfile1\u{1b}[0m\nx\n\u{1b}[1mfile2\u{1b}[0m\ny".to_owned();
         let rendered = initial.clone();
         let mut state = PagerState::new(
-            |_, _, _| rendered.clone(),
+            |_, _, _| test_render(rendered.clone()),
             80,
             6,
             initial,
+            PaneLayout::default(),
             files,
             TintPalette::default(),
         );
@@ -1671,10 +1862,11 @@ mod tests {
         let initial = "file1\nx\nfile2\ny".to_owned();
         let rendered = initial.clone();
         let mut state = PagerState::new(
-            |_, _, _| rendered.clone(),
+            |_, _, _| test_render(rendered.clone()),
             80,
             6,
             initial,
+            PaneLayout::default(),
             files,
             TintPalette::default(),
         );
@@ -1688,10 +1880,11 @@ mod tests {
     #[test]
     fn applying_new_palette_rerenders_output() {
         let mut state = PagerState::new(
-            |_, _, palette| format!("{:?}", palette.changed_line_bg),
+            |_, _, palette| test_render(format!("{:?}", palette.changed_line_bg)),
             80,
             4,
             "None".into(),
+            PaneLayout::default(),
             Vec::new(),
             TintPalette::default(),
         );
@@ -1732,10 +1925,11 @@ mod tests {
     #[test]
     fn question_mark_toggles_help_overlay() {
         let mut state = PagerState::new(
-            |_, _, _| "file1\nbody".into(),
+            |_, _, _| test_render("file1\nbody".into()),
             80,
             10,
             "file1\nbody".into(),
+            PaneLayout::default(),
             Vec::new(),
             TintPalette::default(),
         );
@@ -1757,5 +1951,21 @@ mod tests {
             overlay[0].2.contains("\u{1b}[48;5;240m")
                 || overlay[0].2.contains("\u{1b}[1;48;5;240m")
         );
+    }
+
+    #[test]
+    fn extract_column_range_selects_by_display_width() {
+        assert_eq!(extract_column_range("abcdefgh", 2, 5), "cde");
+        assert_eq!(extract_column_range("abcdefgh", 0, 3), "abc");
+        assert_eq!(extract_column_range("abcdefgh", 6, 100), "gh");
+        assert_eq!(extract_column_range("abcdefgh", 0, 100), "abcdefgh");
+    }
+
+    #[test]
+    fn encode_base64_matches_known_values() {
+        assert_eq!(encode_base64(b"hello"), "aGVsbG8=");
+        assert_eq!(encode_base64(b"ab"), "YWI=");
+        assert_eq!(encode_base64(b"abc"), "YWJj");
+        assert_eq!(encode_base64(b""), "");
     }
 }

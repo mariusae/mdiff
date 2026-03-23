@@ -45,6 +45,33 @@ pub fn should_render_side_by_side(width: usize) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PaneLayout {
+    pub left_end: usize,
+    pub right_start: usize,
+    pub content_start: usize,
+}
+
+pub fn pane_layout(document: &Document, width: usize) -> PaneLayout {
+    if should_render_side_by_side(width) {
+        let layout = layout_for(document, width);
+        PaneLayout {
+            left_end: layout.left_text_width,
+            right_start: layout.left_text_width
+                + PANE_GAP.len()
+                + layout.center_number_width
+                + PANE_GAP.len(),
+            content_start: 0,
+        }
+    } else {
+        PaneLayout {
+            left_end: 0,
+            right_start: 0,
+            content_start: inline_line_number_width(document) + 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TintPalette {
     pub changed_line_bg: Option<AnsiColor>,
     pub gutter_fg: Option<AnsiColor>,
