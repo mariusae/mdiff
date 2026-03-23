@@ -1,12 +1,10 @@
 use crate::terminal_palette::AnsiColor;
-use crate::terminal_palette::user_message_bg;
+use crate::terminal_palette::tint_and_gutter_colors;
 use crate::unified_diff::Document;
 use crate::unified_diff::Hunk;
 use crate::unified_diff::Item;
 use crate::unified_diff::Row;
 use crossterm::terminal;
-use similar::ChangeTag;
-use similar::TextDiff;
 use std::io::IsTerminal;
 use unicode_width::UnicodeWidthChar;
 
@@ -49,25 +47,22 @@ pub fn should_render_side_by_side(width: usize) -> bool {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TintPalette {
     pub changed_line_bg: Option<AnsiColor>,
+    pub gutter_fg: Option<AnsiColor>,
 }
 
 impl TintPalette {
     pub fn detect() -> Self {
+        let (changed_line_bg, gutter_fg) = tint_and_gutter_colors();
         Self {
-            changed_line_bg: user_message_bg(),
+            changed_line_bg,
+            gutter_fg,
         }
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct Segment {
-    text: String,
-    dim: bool,
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct StyledLine {
-    segments: Vec<Segment>,
+    text: String,
     background: Option<AnsiColor>,
 }
 
@@ -83,7 +78,9 @@ struct Layout {
 enum RenderedRow {
     SideBySide {
         left_text: String,
+        left_background: Option<AnsiColor>,
         center_number: String,
+        right_gutter: bool,
         right_line: StyledLine,
     },
     FullWidth(String),
@@ -135,9 +132,8 @@ pub fn render_document(document: &Document, width: usize, palette: &TintPalette)
     output
 }
 
-pub fn render_inline_document(document: &Document, width: usize, palette: &TintPalette) -> String {
+pub fn render_inline_document(document: &Document, _width: usize, palette: &TintPalette) -> String {
     let line_number_width = inline_line_number_width(document);
-    let inline_render_width = inline_render_width(document, width, line_number_width);
     let mut output = String::new();
     let mut index = 0usize;
 
@@ -154,7 +150,6 @@ pub fn render_inline_document(document: &Document, width: usize, palette: &TintP
                 render_inline_file_section(
                     &document.items[index + 1..section_end],
                     line_number_width,
-                    inline_render_width,
                     palette,
                     &mut output,
                 );
@@ -168,7 +163,6 @@ pub fn render_inline_document(document: &Document, width: usize, palette: &TintP
                 render_inline_file_section(
                     &document.items[index..section_end],
                     line_number_width,
-                    inline_render_width,
                     palette,
                     &mut output,
                 );
@@ -183,7 +177,6 @@ pub fn render_inline_document(document: &Document, width: usize, palette: &TintP
 fn render_inline_file_section(
     items: &[Item],
     line_number_width: usize,
-    inline_render_width: usize,
     palette: &TintPalette,
     output: &mut String,
 ) {
@@ -232,6 +225,7 @@ fn render_inline_file_section(
                                 line_number,
                                 text,
                                 line_number_width,
+                                palette,
                             ));
                             output.push('\n');
                         }
@@ -242,7 +236,6 @@ fn render_inline_file_section(
                                 line_number,
                                 text,
                                 line_number_width,
-                                inline_render_width,
                                 palette,
                             ));
                             output.push('\n');
@@ -257,14 +250,13 @@ fn render_inline_file_section(
                                 old_number,
                                 old,
                                 line_number_width,
+                                palette,
                             ));
                             output.push('\n');
                             output.push_str(&render_inline_changed_line(
                                 new_number,
-                                old,
                                 new,
                                 line_number_width,
-                                inline_render_width,
                                 palette,
                             ));
                             output.push('\n');
@@ -323,20 +315,41 @@ fn render_file_section(
                     match render_row(row, &mut old_line, &mut new_line, palette) {
                         RenderedRow::SideBySide {
                             mut left_text,
+                            left_background,
                             center_number,
+                            right_gutter,
                             right_line,
                         } => {
                             if show_gap_continuation && left_text.is_empty() {
                                 left_text = "..".to_owned();
                             }
                             show_gap_continuation = false;
-                            output.push_str(&render_plain_cell(&left_text, layout.left_text_width));
+                            let left_cell =
+                                render_plain_cell(&left_text, layout.left_text_width);
+                            if let Some(bg) = left_background {
+                                output.push_str(&ansi_bg(bg));
+                                output.push_str(&left_cell);
+                                output.push_str("\u{1b}[0m");
+                            } else {
+                                output.push_str(&left_cell);
+                            }
                             output.push_str(PANE_GAP);
                             output.push_str(&render_center_number(
                                 &center_number,
                                 layout.center_number_width,
                             ));
-                            output.push_str(PANE_GAP);
+                            if right_gutter {
+                                if let Some(color) = palette.gutter_fg {
+                                    output.push(' ');
+                                    output.push_str(&ansi_bg(color));
+                                    output.push(' ');
+                                    output.push_str("\u{1b}[0m");
+                                } else {
+                                    output.push_str(PANE_GAP);
+                                }
+                            } else {
+                                output.push_str(PANE_GAP);
+                            }
                             output.push_str(&render_styled_cell(
                                 &right_line,
                                 layout.right_render_width,
@@ -391,11 +404,6 @@ fn inline_line_number_width(document: &Document) -> usize {
         .max()
         .unwrap_or(0);
     MIN_LINE_NUMBER_WIDTH.max(digit_count(max_line))
-}
-
-fn inline_render_width(document: &Document, width: usize, line_number_width: usize) -> usize {
-    let visible_width = width.saturating_sub(line_number_width + 2);
-    visible_width.max(max_inline_render_width(document))
 }
 
 fn max_inline_hunk_line(hunk: &Hunk) -> usize {
@@ -480,34 +488,6 @@ fn max_hunk_right_render_width(hunk: &Hunk) -> usize {
         .unwrap_or(0)
 }
 
-fn max_inline_render_width(document: &Document) -> usize {
-    document
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            Item::Hunk(hunk) => Some(max_hunk_inline_render_width(hunk)),
-            Item::FileHeader(_) | Item::Meta(_) => None,
-        })
-        .max()
-        .unwrap_or(0)
-}
-
-fn max_hunk_inline_render_width(hunk: &Hunk) -> usize {
-    hunk.rows
-        .iter()
-        .map(|row| match row {
-            Row::Context(text) | Row::Delete(text) | Row::Insert(text) => {
-                display_width(&expand_tabs(text))
-            }
-            Row::Change { old, new } => {
-                display_width(&expand_tabs(old)).max(display_width(&expand_tabs(new)))
-            }
-            Row::Annotation(_) => 0,
-        })
-        .max()
-        .unwrap_or(0)
-}
-
 fn next_file_header_index(items: &[Item], start: usize) -> usize {
     items[start..]
         .iter()
@@ -564,69 +544,42 @@ fn render_inline_context_line(line_number: usize, text: &str, line_number_width:
     format!("{prefix}{}", expand_tabs(text))
 }
 
-fn render_inline_deleted_line(line_number: usize, text: &str, line_number_width: usize) -> String {
+fn render_inline_deleted_line(
+    line_number: usize,
+    text: &str,
+    line_number_width: usize,
+    palette: &TintPalette,
+) -> String {
     let prefix = format!("{line_number:>line_number_width$} -");
-    format!("{prefix}{}", expand_tabs(text))
+    let content = format!("{prefix}{}", expand_tabs(text));
+    if let Some(bg) = palette.changed_line_bg {
+        format!("{}{content}\u{1b}[0m", ansi_bg(bg))
+    } else {
+        content
+    }
 }
 
 fn render_inline_inserted_line(
     line_number: usize,
     text: &str,
     line_number_width: usize,
-    render_width: usize,
     palette: &TintPalette,
 ) -> String {
-    let prefix = format!("{line_number:>line_number_width$} +");
-    render_inline_styled_line(
-        prefix,
-        StyledLine {
-            segments: vec![Segment {
-                text: expand_tabs(text),
-                dim: false,
-            }],
-            background: palette.changed_line_bg,
-        },
-        render_width,
-    )
+    let prefix = format!("{line_number:>line_number_width$} ");
+    if let Some(color) = palette.gutter_fg {
+        format!("{prefix}{} \u{1b}[0m{}", ansi_bg(color), expand_tabs(text))
+    } else {
+        format!("{prefix}+{}", expand_tabs(text))
+    }
 }
 
 fn render_inline_changed_line(
     line_number: usize,
-    old: &str,
     new: &str,
     line_number_width: usize,
-    render_width: usize,
     palette: &TintPalette,
 ) -> String {
-    let prefix = format!("{line_number:>line_number_width$} +");
-    render_inline_styled_line(
-        prefix,
-        StyledLine {
-            segments: diff_segments(&expand_tabs(old), &expand_tabs(new)),
-            background: palette.changed_line_bg,
-        },
-        render_width,
-    )
-}
-
-fn render_inline_styled_line(prefix: String, line: StyledLine, _render_width: usize) -> String {
-    let mut output = prefix;
-
-    for segment in line.segments {
-        if segment.text.is_empty() {
-            continue;
-        }
-
-        let style = ansi_style(line.background, segment.dim);
-        if !style.is_empty() {
-            output.push_str(&style);
-        }
-        output.push_str(&segment.text);
-        if !style.is_empty() {
-            output.push_str("\u{1b}[0m");
-        }
-    }
-    output
+    render_inline_inserted_line(line_number, new, line_number_width, palette)
 }
 
 fn render_elided_marker_cell(width: usize) -> String {
@@ -650,13 +603,12 @@ fn render_row(
 
             RenderedRow::SideBySide {
                 left_text: line.clone(),
+                left_background: None,
                 center_number: format_right_line_number(Some(right_number)),
+                right_gutter: false,
                 right_line: StyledLine {
-                    segments: vec![Segment {
-                        text: line,
-                        dim: false,
-                    }],
-                    background: None,
+                    text: line,
+                    ..Default::default()
                 },
             }
         }
@@ -665,7 +617,9 @@ fn render_row(
 
             RenderedRow::SideBySide {
                 left_text: expand_tabs(text),
+                left_background: palette.changed_line_bg,
                 center_number: format_right_line_number(None),
+                right_gutter: false,
                 right_line: StyledLine::default(),
             }
         }
@@ -675,13 +629,12 @@ fn render_row(
 
             RenderedRow::SideBySide {
                 left_text: String::new(),
+                left_background: None,
                 center_number: format_right_line_number(Some(right_number)),
+                right_gutter: true,
                 right_line: StyledLine {
-                    segments: vec![Segment {
-                        text: expand_tabs(text),
-                        dim: false,
-                    }],
-                    background: palette.changed_line_bg,
+                    text: expand_tabs(text),
+                    ..Default::default()
                 },
             }
         }
@@ -690,58 +643,19 @@ fn render_row(
             *old_line += 1;
             *new_line += 1;
 
-            let old_text = expand_tabs(old);
-            let new_text = expand_tabs(new);
-
             RenderedRow::SideBySide {
-                left_text: old_text.clone(),
+                left_text: expand_tabs(old),
+                left_background: palette.changed_line_bg,
                 center_number: format_right_line_number(Some(right_number)),
+                right_gutter: true,
                 right_line: StyledLine {
-                    segments: diff_segments(&old_text, &new_text),
-                    background: palette.changed_line_bg,
+                    text: expand_tabs(new),
+                    ..Default::default()
                 },
             }
         }
         Row::Annotation(text) => RenderedRow::FullWidth(text.clone()),
     }
-}
-
-fn diff_segments(old: &str, new: &str) -> Vec<Segment> {
-    let diff = TextDiff::from_chars(old, new);
-    let mut segments = Vec::new();
-
-    for change in diff.iter_all_changes() {
-        let value = change.value().to_string();
-        match change.tag() {
-            ChangeTag::Equal => push_segment(&mut segments, value, true),
-            ChangeTag::Insert => push_segment(&mut segments, value, false),
-            ChangeTag::Delete => {}
-        }
-    }
-
-    if segments.is_empty() {
-        segments.push(Segment {
-            text: new.to_owned(),
-            dim: false,
-        });
-    }
-
-    segments
-}
-
-fn push_segment(segments: &mut Vec<Segment>, text: String, dim: bool) {
-    if text.is_empty() {
-        return;
-    }
-
-    if let Some(last) = segments.last_mut()
-        && last.dim == dim
-    {
-        last.text.push_str(&text);
-        return;
-    }
-
-    segments.push(Segment { text, dim });
 }
 
 fn render_plain_cell(text: &str, width: usize) -> String {
@@ -764,50 +678,29 @@ fn render_center_number(label: &str, width: usize) -> String {
 }
 
 fn render_styled_cell(line: &StyledLine, width: usize) -> String {
-    let mut output = String::new();
-    let mut used = 0usize;
-    for segment in &line.segments {
-        if used >= width {
-            break;
-        }
-
-        let visible = clip_plain_text(&segment.text, width - used);
-        if visible.is_empty() {
-            continue;
-        }
-
-        let style = ansi_style(line.background, segment.dim);
-        if !style.is_empty() {
-            output.push_str(&style);
-        }
-        output.push_str(&visible);
-        if !style.is_empty() {
-            output.push_str("\u{1b}[0m");
-        }
-
-        used += display_width(&visible);
+    let visible = clip_plain_text(&line.text, width);
+    if visible.is_empty() {
+        return String::new();
     }
 
-    output
+    if let Some(bg) = line.background {
+        format!("{}{visible}\u{1b}[0m", ansi_bg(bg))
+    } else {
+        visible
+    }
 }
 
-fn ansi_style(background: Option<AnsiColor>, dim: bool) -> String {
-    let mut codes = Vec::new();
-    if dim {
-        codes.push("2".to_owned());
+fn ansi_bg(color: AnsiColor) -> String {
+    match color {
+        AnsiColor::Indexed(index) => format!("\u{1b}[48;5;{index}m"),
+        AnsiColor::Rgb(r, g, b) => format!("\u{1b}[48;2;{r};{g};{b}m"),
     }
+}
 
-    if let Some(color) = background {
-        match color {
-            AnsiColor::Indexed(index) => codes.push(format!("48;5;{index}")),
-            AnsiColor::Rgb(r, g, b) => codes.push(format!("48;2;{r};{g};{b}")),
-        }
-    }
-
-    if codes.is_empty() {
-        String::new()
-    } else {
-        format!("\u{1b}[{}m", codes.join(";"))
+fn ansi_fg(color: AnsiColor) -> String {
+    match color {
+        AnsiColor::Indexed(index) => format!("\u{1b}[38;5;{index}m"),
+        AnsiColor::Rgb(r, g, b) => format!("\u{1b}[38;2;{r};{g};{b}m"),
     }
 }
 
@@ -874,10 +767,8 @@ fn char_width(ch: char) -> usize {
 mod tests {
     use super::Layout;
     use super::RenderMode;
-    use super::Segment;
     use super::StyledLine;
     use super::TintPalette;
-    use super::diff_segments;
     use super::display_width;
     use super::expand_tabs;
     use super::format_right_line_number;
@@ -920,17 +811,19 @@ mod tests {
         };
         let palette = TintPalette {
             changed_line_bg: Some(AnsiColor::Indexed(240)),
+            gutter_fg: Some(AnsiColor::Indexed(238)),
         };
 
         let rendered = render_document(&document, 140, &palette);
         assert!(rendered.contains("\u{1b}[1mdemo.txt\u{1b}[0m"));
         assert!(rendered.contains("⋮"));
         assert!(!rendered.contains("@@ -1 +1 @@"));
-        assert!(rendered.contains("\u{1b}[48;5;240m"));
-        assert!(rendered.contains("\u{1b}[2;48;5;240m"));
+        // left (deleted) side has tinted background
+        assert!(rendered.contains("\u{1b}[48;5;240mcat"));
+        // right (added) side has gutter mark (foreground color)
+        assert!(rendered.contains("\u{1b}[48;5;238m \u{1b}[0mcot"));
         assert!(rendered.contains("\u{1b}[1m 3  \u{1b}[0m"));
         assert!(!rendered.contains(" | "));
-        assert!(!rendered.contains("+ cot"));
     }
 
     #[test]
@@ -964,17 +857,20 @@ mod tests {
         };
         let palette = TintPalette {
             changed_line_bg: Some(AnsiColor::Indexed(240)),
+            gutter_fg: Some(AnsiColor::Indexed(238)),
         };
 
         let rendered = render_inline_document(&document, 80, &palette);
         assert!(rendered.contains("\u{1b}[1msrc/unified_diff.rs\u{1b}[0m"));
         assert!(rendered.contains("   ⋮"));
         assert!(rendered.contains("  15      pub old_start: usize,"));
-        assert!(rendered.contains("  16 -    pub old_len: usize,"));
+        // deleted lines have tinted background
+        assert!(rendered.contains("\u{1b}[48;5;240m"));
+        assert!(rendered.contains("  16 -"));
         assert!(rendered.contains("  16      pub new_start: usize,"));
-        assert!(rendered.contains(" 127 -    let (old_start, old_len, new_start, new_len)"));
-        assert!(rendered.contains(" 126 +"));
-        assert!(rendered.contains("\u{1b}[48;5;240m") || rendered.contains("\u{1b}[2;48;5;240m"));
+        assert!(rendered.contains(" 127 -"));
+        // changed/inserted lines have gutter mark
+        assert!(rendered.contains("\u{1b}[48;5;238m \u{1b}[0m"));
     }
 
     #[test]
@@ -998,6 +894,7 @@ mod tests {
         };
         let palette = TintPalette {
             changed_line_bg: Some(AnsiColor::Indexed(240)),
+            gutter_fg: Some(AnsiColor::Indexed(238)),
         };
 
         let rendered = render_document(&document, 140, &palette);
@@ -1007,24 +904,25 @@ mod tests {
     }
 
     #[test]
-    fn inline_tint_extends_to_terminal_edge() {
+    fn inline_insert_uses_gutter_mark() {
         let palette = TintPalette {
             changed_line_bg: Some(AnsiColor::Indexed(240)),
+            gutter_fg: Some(AnsiColor::Indexed(238)),
         };
 
-        let line = render_inline_inserted_line(12, "abc", 4, 14, &palette);
-        assert!(line.starts_with("  12 +"));
-        assert!(line.contains("\u{1b}[48;5;240mabc"));
-        assert!(!line.ends_with("       \u{1b}[0m"));
+        let line = render_inline_inserted_line(12, "abc", 4, &palette);
+        assert!(line.starts_with("  12 "));
+        assert!(line.contains("\u{1b}[48;5;238m \u{1b}[0mabc"));
     }
 
     #[test]
     fn inline_insertions_keep_full_text_for_horizontal_scroll() {
         let palette = TintPalette {
             changed_line_bg: Some(AnsiColor::Indexed(240)),
+            gutter_fg: Some(AnsiColor::Indexed(238)),
         };
 
-        let line = render_inline_inserted_line(12, "abcdefghijklmnopqrstuvwxyz", 4, 26, &palette);
+        let line = render_inline_inserted_line(12, "abcdefghijklmnopqrstuvwxyz", 4, &palette);
         assert!(line.contains("abcdefghijklmnopqrstuvwxyz"));
     }
 
@@ -1044,27 +942,24 @@ mod tests {
         };
         let palette = TintPalette {
             changed_line_bg: Some(AnsiColor::Indexed(240)),
+            gutter_fg: Some(AnsiColor::Indexed(238)),
         };
 
         let rendered = render_document(&document, 140, &palette);
         assert!(rendered.contains(long));
-        assert!(rendered.contains("\u{1b}[48;5;240mabc"));
-        assert!(rendered.contains("abc"));
-        assert!(!rendered.contains("     \u{1b}[0m"));
+        // inserted lines use gutter mark, not background
+        assert!(rendered.contains("\u{1b}[48;5;238m \u{1b}[0mabc"));
     }
 
     #[test]
     fn non_tinted_side_by_side_cells_do_not_pad_hidden_spaces() {
         let line = StyledLine {
-            segments: vec![Segment {
-                text: "abc".into(),
-                dim: true,
-            }],
-            background: None,
+            text: "abc".into(),
+            ..Default::default()
         };
 
         let rendered = render_styled_cell(&line, 20);
-        assert_eq!(rendered, "\u{1b}[2mabc\u{1b}[0m");
+        assert_eq!(rendered, "abc");
     }
 
     #[test]
@@ -1077,31 +972,14 @@ mod tests {
     }
 
     #[test]
-    fn styled_line_tracks_segments() {
+    fn styled_line_with_background_renders_bg() {
         let line = StyledLine {
-            segments: vec![Segment {
-                text: "abc".into(),
-                dim: true,
-            }],
-            background: None,
+            text: "abc".into(),
+            background: Some(AnsiColor::Indexed(240)),
         };
 
-        assert_eq!(line.segments.len(), 1);
-    }
-
-    #[test]
-    fn merges_adjacent_diff_runs() {
-        let segments = diff_segments(
-            "    if render_mode.side_by_side {",
-            "    let rendered = if render_mode.side_by_side {",
-        );
-        assert_eq!(segments.len(), 3);
-        assert_eq!(segments[0].text, "    ");
-        assert!(segments[0].dim);
-        assert_eq!(segments[1].text, "let rendered = ");
-        assert!(!segments[1].dim);
-        assert_eq!(segments[2].text, "if render_mode.side_by_side {");
-        assert!(segments[2].dim);
+        let rendered = render_styled_cell(&line, 20);
+        assert_eq!(rendered, "\u{1b}[48;5;240mabc\u{1b}[0m");
     }
 
     #[test]

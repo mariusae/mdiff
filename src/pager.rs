@@ -434,7 +434,7 @@ fn render_visible_cells(
     }
 
     let total_width: usize = cells.iter().map(|cell| char_width(cell.ch)).sum();
-    let line_background = cells.iter().find_map(|cell| cell.style.background);
+    let line_background = cells.last().and_then(|cell| cell.style.background);
     let right_overflow = total_width > start_col.saturating_add(width);
     let visible_width = if right_overflow {
         width.saturating_sub(1)
@@ -1700,6 +1700,7 @@ mod tests {
         state.apply_palette(
             TintPalette {
                 changed_line_bg: Some(AnsiColor::Indexed(240)),
+                gutter_fg: Some(AnsiColor::Indexed(238)),
             },
             None,
         );

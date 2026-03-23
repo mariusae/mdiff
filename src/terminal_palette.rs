@@ -4,8 +4,10 @@ use crate::color::perceptual_distance;
 use crossterm::style::Color as CrosstermColor;
 use crossterm::style::query_background_color;
 
-const LIGHT_BG_ALPHA: f32 = 0.04;
-const DARK_BG_ALPHA: f32 = 0.04;
+const LIGHT_BG_ALPHA: f32 = 0.03;
+const DARK_BG_ALPHA: f32 = 0.03;
+const GUTTER_LIGHT_ALPHA: f32 = 0.24;
+const GUTTER_DARK_ALPHA: f32 = 0.24;
 const SEARCH_LIGHT_BG_ALPHA: f32 = 0.10;
 const SEARCH_DARK_BG_ALPHA: f32 = 0.20;
 
@@ -61,6 +63,23 @@ pub fn stdout_color_level() -> StdoutColorLevel {
 
 pub fn user_message_bg() -> Option<AnsiColor> {
     tint_diagnostics().final_color
+}
+
+pub fn tint_and_gutter_colors() -> (Option<AnsiColor>, Option<AnsiColor>) {
+    let bg_rgb = match query_background_rgb() {
+        Ok(Some(bg)) => bg,
+        _ => return (None, None),
+    };
+    let level = stdout_color_level();
+    let light = is_light(bg_rgb);
+    let (overlay, bg_alpha, gutter_alpha) = if light {
+        ((0, 0, 0), LIGHT_BG_ALPHA, GUTTER_LIGHT_ALPHA)
+    } else {
+        ((255, 255, 255), DARK_BG_ALPHA, GUTTER_DARK_ALPHA)
+    };
+    let bg = best_color_for(blend(overlay, bg_rgb, bg_alpha), level);
+    let gutter = best_color_for(blend(overlay, bg_rgb, gutter_alpha), level);
+    (bg, gutter)
 }
 
 pub fn search_highlight_bg() -> Option<AnsiColor> {
@@ -228,7 +247,7 @@ mod tests {
     fn exposes_blended_rgb_in_diagnostics() {
         let diagnostics = tint_diagnostics_for(Ok(Some((255, 255, 255))));
         assert_eq!(diagnostics.queried_bg, Some((255, 255, 255)));
-        assert_eq!(diagnostics.blended_rgb, Some((244, 244, 244)));
+        assert_eq!(diagnostics.blended_rgb, Some((247, 247, 247)));
     }
 
     #[test]
