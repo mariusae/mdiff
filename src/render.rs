@@ -561,7 +561,7 @@ fn render_inline_ellipsis(line_number_width: usize, _elided: usize) -> String {
 
 fn render_inline_context_line(line_number: usize, text: &str, line_number_width: usize) -> String {
     let prefix = format!("{line_number:>line_number_width$}  ");
-    format!("{prefix}\u{1b}[2m{}\u{1b}[0m", expand_tabs(text))
+    format!("{prefix}{}", expand_tabs(text))
 }
 
 fn render_inline_deleted_line(line_number: usize, text: &str, line_number_width: usize) -> String {
@@ -654,7 +654,7 @@ fn render_row(
                 right_line: StyledLine {
                     segments: vec![Segment {
                         text: line,
-                        dim: true,
+                        dim: false,
                     }],
                     background: None,
                 },
@@ -969,9 +969,9 @@ mod tests {
         let rendered = render_inline_document(&document, 80, &palette);
         assert!(rendered.contains("\u{1b}[1msrc/unified_diff.rs\u{1b}[0m"));
         assert!(rendered.contains("   ⋮"));
-        assert!(rendered.contains("  15  \u{1b}[2m    pub old_start: usize,"));
+        assert!(rendered.contains("  15      pub old_start: usize,"));
         assert!(rendered.contains("  16 -    pub old_len: usize,"));
-        assert!(rendered.contains("  16  \u{1b}[2m    pub new_start: usize,"));
+        assert!(rendered.contains("  16      pub new_start: usize,"));
         assert!(rendered.contains(" 127 -    let (old_start, old_len, new_start, new_len)"));
         assert!(rendered.contains(" 126 +"));
         assert!(rendered.contains("\u{1b}[48;5;240m") || rendered.contains("\u{1b}[2;48;5;240m"));
