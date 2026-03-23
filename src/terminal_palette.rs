@@ -45,12 +45,18 @@ pub struct TintDiagnostics {
 }
 
 pub fn stdout_color_level() -> StdoutColorLevel {
-    match supports_color::on_cached(supports_color::Stream::Stdout) {
+    let level = match supports_color::on_cached(supports_color::Stream::Stdout) {
         Some(level) if level.has_16m => StdoutColorLevel::TrueColor,
         Some(level) if level.has_256 => StdoutColorLevel::Ansi256,
         Some(_) => StdoutColorLevel::Ansi16,
         None => StdoutColorLevel::Unknown,
+    };
+    // tmux passes 24-bit color sequences through to the outer terminal,
+    // but TERM=tmux-256color causes supports_color to report only Ansi256.
+    if level == StdoutColorLevel::Ansi256 && std::env::var_os("TMUX").is_some() {
+        return StdoutColorLevel::TrueColor;
     }
+    level
 }
 
 pub fn user_message_bg() -> Option<AnsiColor> {
