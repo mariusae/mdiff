@@ -213,13 +213,12 @@ where
                 match mouse.kind {
                     MouseEventKind::ScrollUp => state.scroll_up(MOUSE_SCROLL_LINES),
                     MouseEventKind::ScrollDown => state.scroll_down(MOUSE_SCROLL_LINES),
-                    _ => {}
+                    _ => continue,
                 }
             }
             Event::FocusGained => state.refresh_palette_from_terminal(),
-            Event::FocusLost => {}
             Event::Resize(_, _) => {}
-            _ => {}
+            _ => continue,
         }
     }
 }

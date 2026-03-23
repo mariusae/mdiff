@@ -550,8 +550,13 @@ fn render_inline_deleted_line(
     line_number_width: usize,
     palette: &TintPalette,
 ) -> String {
-    let prefix = format!("{line_number:>line_number_width$} -");
-    let content = format!("{prefix}{}", expand_tabs(text));
+    let content = if palette.changed_line_bg.is_some() {
+        let prefix = format!("{line_number:>line_number_width$}  ");
+        format!("{prefix}{}", expand_tabs(text))
+    } else {
+        let prefix = format!("{line_number:>line_number_width$} -");
+        format!("{prefix}{}", expand_tabs(text))
+    };
     if let Some(bg) = palette.changed_line_bg {
         format!("{}{content}\u{1b}[0m", ansi_bg(bg))
     } else {
@@ -866,9 +871,9 @@ mod tests {
         assert!(rendered.contains("  15      pub old_start: usize,"));
         // deleted lines have tinted background
         assert!(rendered.contains("\u{1b}[48;5;240m"));
-        assert!(rendered.contains("  16 -"));
+        assert!(rendered.contains("  16  "));
         assert!(rendered.contains("  16      pub new_start: usize,"));
-        assert!(rendered.contains(" 127 -"));
+        assert!(rendered.contains(" 127  "));
         // changed/inserted lines have gutter mark
         assert!(rendered.contains("\u{1b}[48;5;238m \u{1b}[0m"));
     }
