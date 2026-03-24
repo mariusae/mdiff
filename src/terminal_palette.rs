@@ -5,7 +5,7 @@ use crossterm::style::Color as CrosstermColor;
 use crossterm::style::query_background_color;
 
 const LIGHT_BG_ALPHA: f32 = 0.03;
-const DARK_BG_ALPHA: f32 = 0.03;
+const DARK_BG_ALPHA: f32 = 0.10;
 const GUTTER_LIGHT_ALPHA: f32 = 0.24;
 const GUTTER_DARK_ALPHA: f32 = 0.24;
 const SEARCH_LIGHT_BG_ALPHA: f32 = 0.10;
