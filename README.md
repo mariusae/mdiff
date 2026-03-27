@@ -50,6 +50,8 @@ The diff tint is derived from the terminal background when the terminal supports
 
 When output is longer than the current terminal height, `mdiff` opens an interactive pager in the alternate screen.
 
+Pass `-P` or `--pager` to always open the pager when stdout is a terminal, even if the rendered diff would fit on screen.
+
 Pager controls:
 
 - `q`, `Esc`: quit the pager

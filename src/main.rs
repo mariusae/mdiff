@@ -28,6 +28,8 @@ fn run() -> Result<i32> {
     let mut args: Vec<OsString> = env::args_os().skip(1).collect();
     let cwd = env::current_dir().context("failed to determine the current directory")?;
     let rage_mode = take_flag(&mut args, OsStr::new("--rage"));
+    let force_pager =
+        take_flag(&mut args, OsStr::new("-P")) || take_flag(&mut args, OsStr::new("--pager"));
     if rage_mode {
         return rage::run(&cwd, &args);
     }
@@ -46,7 +48,7 @@ fn run() -> Result<i32> {
     let raw_stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let document = unified_diff::parse(&raw_stdout);
     let files = document.file_paths();
-    let rendered = pager::page_or_render(files, |width, file_filter, palette| {
+    let rendered = pager::page_or_render(files, force_pager, |width, file_filter, palette| {
         let filtered = document.filter_files(file_filter);
         let layout = render::pane_layout(&filtered, width);
         let output = if render::should_render_side_by_side(width) {
@@ -90,6 +92,36 @@ mod tests {
         ];
 
         assert!(take_flag(&mut args, OsStr::new("--rage")));
+        assert_eq!(
+            args,
+            vec![OsString::from("--cached"), OsString::from("--stat")]
+        );
+    }
+
+    #[test]
+    fn removes_short_pager_flag_from_arguments() {
+        let mut args = vec![
+            OsString::from("-P"),
+            OsString::from("--cached"),
+            OsString::from("--stat"),
+        ];
+
+        assert!(take_flag(&mut args, OsStr::new("-P")));
+        assert_eq!(
+            args,
+            vec![OsString::from("--cached"), OsString::from("--stat")]
+        );
+    }
+
+    #[test]
+    fn removes_long_pager_flag_from_arguments() {
+        let mut args = vec![
+            OsString::from("--cached"),
+            OsString::from("--pager"),
+            OsString::from("--stat"),
+        ];
+
+        assert!(take_flag(&mut args, OsStr::new("--pager")));
         assert_eq!(
             args,
             vec![OsString::from("--cached"), OsString::from("--stat")]

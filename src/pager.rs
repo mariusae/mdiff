@@ -126,13 +126,14 @@ struct Selection {
     extent_line: usize,
 }
 
-pub fn page_or_render<F>(files: Vec<String>, render: F) -> Result<Option<String>>
+pub fn page_or_render<F>(files: Vec<String>, force_pager: bool, render: F) -> Result<Option<String>>
 where
     F: Fn(usize, &str, &TintPalette) -> (String, PaneLayout),
 {
     let palette = TintPalette::detect();
 
-    if !std::io::stdout().is_terminal() {
+    let stdout_is_tty = std::io::stdout().is_terminal();
+    if !stdout_is_tty {
         let (output, _) = render(0, "", &palette);
         return Ok(Some(output));
     }
@@ -142,7 +143,12 @@ where
     let rows = rows as usize;
     let (initial_output, initial_layout) = render(width, "", &palette);
 
-    if line_count(&initial_output) <= rows {
+    if !should_page_output(
+        stdout_is_tty,
+        force_pager,
+        line_count(&initial_output),
+        rows,
+    ) {
         return Ok(Some(initial_output));
     }
 
@@ -334,6 +340,15 @@ where
 
 fn line_count(output: &str) -> usize {
     output.lines().count()
+}
+
+fn should_page_output(
+    stdout_is_tty: bool,
+    force_pager: bool,
+    output_line_count: usize,
+    terminal_rows: usize,
+) -> bool {
+    stdout_is_tty && (force_pager || output_line_count > terminal_rows)
 }
 
 fn clip_ansi_text(text: &str, width: usize) -> String {
@@ -1611,6 +1626,7 @@ mod tests {
     use super::render_centered_overlay_lines;
     use super::render_highlighted_line;
     use super::render_search_hud;
+    use super::should_page_output;
     use super::strip_ansi_text;
     use crate::render::PaneLayout;
     use crate::render::TintPalette;
@@ -1634,6 +1650,21 @@ mod tests {
     fn clipped_overflow_uses_right_marker() {
         assert_eq!(clip_ansi_text_from("abcdefgh", 0, 4), "abc»");
         assert_eq!(clip_ansi_text_from("abcdefgh", 4, 4), "efgh");
+    }
+
+    #[test]
+    fn force_pager_overrides_screen_fit() {
+        assert!(should_page_output(true, true, 5, 20));
+    }
+
+    #[test]
+    fn fitting_output_skips_pager_without_override() {
+        assert!(!should_page_output(true, false, 5, 20));
+    }
+
+    #[test]
+    fn non_tty_output_never_pages() {
+        assert!(!should_page_output(false, true, 50, 20));
     }
 
     #[test]
