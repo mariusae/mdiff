@@ -146,7 +146,15 @@ where
         return Ok(Some(initial_output));
     }
 
-    page(files, render, width, rows, initial_output, initial_layout, palette)?;
+    page(
+        files,
+        render,
+        width,
+        rows,
+        initial_output,
+        initial_layout,
+        palette,
+    )?;
     Ok(None)
 }
 
@@ -333,7 +341,15 @@ fn clip_ansi_text(text: &str, width: usize) -> String {
 }
 
 fn clip_ansi_text_from(text: &str, start_col: usize, width: usize) -> String {
-    render_visible_cells(&parse_styled_cells(text), start_col, width, &[], None, None)
+    render_visible_cells(
+        &parse_styled_cells(text),
+        start_col,
+        width,
+        &[],
+        None,
+        None,
+        0,
+    )
 }
 
 fn strip_ansi_text(text: &str) -> String {
@@ -467,6 +483,7 @@ fn render_highlighted_line(
     matches: &[SearchMatch],
     search_bg: Option<AnsiColor>,
     selection: Option<(usize, usize)>,
+    content_start: usize,
 ) -> String {
     render_visible_cells(
         &parse_styled_cells(text),
@@ -475,6 +492,7 @@ fn render_highlighted_line(
         matches,
         search_bg,
         selection,
+        content_start,
     )
 }
 
@@ -485,13 +503,14 @@ fn render_visible_cells(
     matches: &[SearchMatch],
     search_bg: Option<AnsiColor>,
     selection: Option<(usize, usize)>,
+    content_start: usize,
 ) -> String {
     if width == 0 {
         return String::new();
     }
 
     let total_width: usize = cells.iter().map(|cell| char_width(cell.ch)).sum();
-    let line_background = cells.last().and_then(|cell| cell.style.background);
+    let trailing_background = trailing_background(cells, total_width);
     let right_overflow = total_width > start_col.saturating_add(width);
     let visible_width = if right_overflow {
         width.saturating_sub(1)
@@ -544,7 +563,8 @@ fn render_visible_cells(
         rendered.push_str("\u{1b}[0m");
     }
 
-    if let Some(background) = line_background
+    if let Some((background, background_start)) = trailing_background
+        && background_start >= content_start
         && used < visible_width
     {
         if let Some(prefix) = style_prefix(TextStyle {
@@ -562,6 +582,20 @@ fn render_visible_cells(
     }
 
     rendered
+}
+
+fn trailing_background(cells: &[StyledCell], total_width: usize) -> Option<(AnsiColor, usize)> {
+    let background = cells.last()?.style.background?;
+    let mut run_width = 0usize;
+
+    for cell in cells.iter().rev() {
+        if cell.style.background != Some(background) {
+            break;
+        }
+        run_width += char_width(cell.ch);
+    }
+
+    Some((background, total_width.saturating_sub(run_width)))
 }
 
 fn plain_offset_to_column(text: &str, offset: usize) -> usize {
@@ -870,6 +904,9 @@ where
             &matches,
             self.search_bg,
             selection,
+            self.pane_layout
+                .content_start
+                .max(self.pane_layout.right_start),
         ))
     }
 
@@ -1473,8 +1510,16 @@ fn encode_base64(data: &[u8]) -> String {
     let mut i = 0;
     while i < data.len() {
         let b0 = data[i] as u32;
-        let b1 = if i + 1 < data.len() { data[i + 1] as u32 } else { 0 };
-        let b2 = if i + 2 < data.len() { data[i + 2] as u32 } else { 0 };
+        let b1 = if i + 1 < data.len() {
+            data[i + 1] as u32
+        } else {
+            0
+        };
+        let b2 = if i + 2 < data.len() {
+            data[i + 2] as u32
+        } else {
+            0
+        };
         let triple = (b0 << 16) | (b1 << 8) | b2;
         result.push(CHARS[((triple >> 18) & 0x3f) as usize] as char);
         result.push(CHARS[((triple >> 12) & 0x3f) as usize] as char);
@@ -1723,6 +1768,7 @@ mod tests {
             }],
             Some(AnsiColor::Indexed(240)),
             None,
+            0,
         );
         assert!(rendered.contains("\u{1b}[1;48;5;240m"));
     }
@@ -1730,10 +1776,18 @@ mod tests {
     #[test]
     fn tinted_lines_fill_to_edge_without_forcing_overflow_marker() {
         let rendered =
-            render_highlighted_line("\u{1b}[48;5;240mabc\u{1b}[0m", 0, 6, &[], None, None);
+            render_highlighted_line("\u{1b}[48;5;240mabc\u{1b}[0m", 0, 6, &[], None, None, 0);
         assert!(rendered.contains("\u{1b}[48;5;240mabc"));
         assert!(rendered.contains("   \u{1b}[0m"));
         assert!(!rendered.contains('»'));
+    }
+
+    #[test]
+    fn gutter_only_background_does_not_fill_to_edge() {
+        let rendered =
+            render_highlighted_line("  12 \u{1b}[48;5;238m \u{1b}[0m", 0, 10, &[], None, None, 6);
+        assert_eq!(rendered.matches("\u{1b}[48;5;238m").count(), 1);
+        assert!(!rendered.contains("\u{1b}[48;5;238m    "));
     }
 
     #[test]
