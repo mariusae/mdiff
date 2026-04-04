@@ -1098,6 +1098,7 @@ where
             &[],
             self.search_bg,
             None,
+            0,
         ))
     }
 
