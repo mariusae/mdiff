@@ -1,4 +1,8 @@
+use crate::render::GapDescriptor;
+use crate::render::GapId;
+use crate::render::GapState;
 use crate::render::PaneLayout;
+use crate::render::RenderedDocument;
 use crate::render::TintPalette;
 use crate::terminal_palette::AnsiColor;
 use crate::terminal_palette::search_highlight_bg;
@@ -23,13 +27,23 @@ use crossterm::terminal::Clear;
 use crossterm::terminal::ClearType;
 use crossterm::terminal::EnterAlternateScreen;
 use crossterm::terminal::LeaveAlternateScreen;
+use std::collections::HashMap;
 use std::io;
 use std::io::IsTerminal;
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::mpsc;
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::Sender;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 use unicode_width::UnicodeWidthChar;
 
 const MOUSE_SCROLL_LINES: usize = 3;
 const HORIZONTAL_SCROLL_COLUMNS: usize = 8;
+const SPINNER_TICK: Duration = Duration::from_millis(80);
+const IDLE_POLL: Duration = Duration::from_millis(250);
 const FILE_FILTER_PROMPT: &str = "› ";
 const HELP_LINES: &[&str] = &[
     "mdiff help",
@@ -126,63 +140,71 @@ struct Selection {
     extent_line: usize,
 }
 
-pub fn page_or_render<F>(files: Vec<String>, force_pager: bool, render: F) -> Result<Option<String>>
+struct GapFetchResult {
+    gap: GapDescriptor,
+    lines: Result<Vec<String>, String>,
+}
+
+pub fn page_or_render<F, G>(
+    files: Vec<String>,
+    force_pager: bool,
+    render: F,
+    fetch_gap: G,
+) -> Result<Option<String>>
 where
-    F: Fn(usize, &str, &TintPalette) -> (String, PaneLayout),
+    F: Fn(usize, &str, &TintPalette, &HashMap<GapId, GapState>, usize) -> RenderedDocument,
+    G: Fn(&GapDescriptor) -> Result<Vec<String>> + Send + Sync + 'static,
 {
     let palette = TintPalette::detect();
 
     let stdout_is_tty = std::io::stdout().is_terminal();
     if !stdout_is_tty {
-        let (output, _) = render(0, "", &palette);
-        return Ok(Some(output));
+        return Ok(Some(
+            render(0, "", &palette, &HashMap::new(), 0).into_output(),
+        ));
     }
 
     let (width, rows) = terminal::size().context("failed to read terminal size")?;
     let width = width as usize;
     let rows = rows as usize;
-    let (initial_output, initial_layout) = render(width, "", &palette);
+    let initial_render = render(width, "", &palette, &HashMap::new(), 0);
 
-    if !should_page_output(
-        stdout_is_tty,
-        force_pager,
-        line_count(&initial_output),
-        rows,
-    ) {
-        return Ok(Some(initial_output));
+    if !should_page_output(stdout_is_tty, force_pager, initial_render.lines.len(), rows) {
+        return Ok(Some(initial_render.into_output()));
     }
 
     page(
         files,
         render,
+        fetch_gap,
         width,
         rows,
-        initial_output,
-        initial_layout,
+        initial_render,
         palette,
     )?;
     Ok(None)
 }
 
-fn page<F>(
+fn page<F, G>(
     files: Vec<String>,
     render: F,
+    fetch_gap: G,
     width: usize,
     height: usize,
-    initial_output: String,
-    initial_layout: PaneLayout,
+    initial_render: RenderedDocument,
     initial_palette: TintPalette,
 ) -> Result<()>
 where
-    F: Fn(usize, &str, &TintPalette) -> (String, PaneLayout),
+    F: Fn(usize, &str, &TintPalette, &HashMap<GapId, GapState>, usize) -> RenderedDocument,
+    G: Fn(&GapDescriptor) -> Result<Vec<String>> + Send + Sync + 'static,
 {
     let mut stdout = io::stdout();
     let mut state = PagerState::new(
         render,
+        fetch_gap,
         width,
         height,
-        initial_output,
-        initial_layout,
+        initial_render,
         files,
         initial_palette,
     );
@@ -212,31 +234,68 @@ where
     result
 }
 
-fn run_pager<F>(stdout: &mut io::Stdout, state: &mut PagerState<F>) -> Result<()>
+fn run_pager<F, G>(stdout: &mut io::Stdout, state: &mut PagerState<F, G>) -> Result<()>
 where
-    F: Fn(usize, &str, &TintPalette) -> (String, PaneLayout),
+    F: Fn(usize, &str, &TintPalette, &HashMap<GapId, GapState>, usize) -> RenderedDocument,
+    G: Fn(&GapDescriptor) -> Result<Vec<String>> + Send + Sync + 'static,
 {
+    let mut needs_redraw = true;
+
     loop {
-        state.refresh_dimensions()?;
-        draw(stdout, state)?;
+        if state.refresh_dimensions()? {
+            needs_redraw = true;
+        }
+        if state.drain_gap_fetch_results() {
+            needs_redraw = true;
+        }
+        if state.advance_spinner_if_needed() {
+            needs_redraw = true;
+        }
+        if needs_redraw {
+            draw(stdout, state)?;
+            needs_redraw = false;
+        }
+
+        if !event::poll(state.poll_timeout()).context("failed to poll pager input")? {
+            continue;
+        }
 
         match event::read().context("failed to read pager input")? {
             Event::Key(key) => {
                 state.selection = None;
 
                 if state.handle_hud_key(key.code, key.modifiers) {
+                    needs_redraw = true;
                     continue;
                 }
 
                 match key.code {
                     KeyCode::Char('q') => return Ok(()),
                     KeyCode::Esc => return Ok(()),
-                    KeyCode::Up | KeyCode::PageUp => state.page_up(),
-                    KeyCode::Down | KeyCode::PageDown | KeyCode::Char(' ') => state.page_down(),
-                    KeyCode::Left => state.scroll_left(),
-                    KeyCode::Right => state.scroll_right(),
-                    KeyCode::Home | KeyCode::Char('g') => state.to_top(),
-                    KeyCode::End | KeyCode::Char('G') => state.to_bottom(),
+                    KeyCode::Up | KeyCode::PageUp => {
+                        state.page_up();
+                        needs_redraw = true;
+                    }
+                    KeyCode::Down | KeyCode::PageDown | KeyCode::Char(' ') => {
+                        state.page_down();
+                        needs_redraw = true;
+                    }
+                    KeyCode::Left => {
+                        state.scroll_left();
+                        needs_redraw = true;
+                    }
+                    KeyCode::Right => {
+                        state.scroll_right();
+                        needs_redraw = true;
+                    }
+                    KeyCode::Home | KeyCode::Char('g') => {
+                        state.to_top();
+                        needs_redraw = true;
+                    }
+                    KeyCode::End | KeyCode::Char('G') => {
+                        state.to_bottom();
+                        needs_redraw = true;
+                    }
                     _ => {}
                 }
             }
@@ -250,8 +309,12 @@ where
                     MouseEventKind::ScrollDown => state.scroll_down(MOUSE_SCROLL_LINES),
                     MouseEventKind::Down(MouseButton::Left) => {
                         let row = mouse.row as usize;
-                        if row < state.viewport_height() {
-                            let line = state.offset + row;
+                        if let Some(content_row) = state.content_row_from_screen(row) {
+                            if state.try_activate_gap(content_row) {
+                                needs_redraw = true;
+                                continue;
+                            }
+                            let line = state.offset + content_row;
                             let content_col = state.horizontal_offset + mouse.column as usize;
                             let pane = state.pane_at_column(content_col);
                             state.selection = Some(Selection {
@@ -259,51 +322,75 @@ where
                                 anchor_line: line,
                                 extent_line: line,
                             });
+                            needs_redraw = true;
                         }
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
                         let row = mouse.row as usize;
-                        let max_row = state.viewport_height().saturating_sub(1);
-                        let line = state.offset + row.min(max_row);
-                        if let Some(ref mut sel) = state.selection {
-                            sel.extent_line = line;
+                        if let Some(content_row) = state.content_row_from_screen(row) {
+                            let max_row = state.viewport_height().saturating_sub(1);
+                            let line = state.offset + content_row.min(max_row);
+                            if let Some(ref mut sel) = state.selection {
+                                sel.extent_line = line;
+                            }
+                            needs_redraw = true;
                         }
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
                         let row = mouse.row as usize;
-                        let max_row = state.viewport_height().saturating_sub(1);
-                        let line = state.offset + row.min(max_row);
-                        if let Some(ref mut sel) = state.selection {
-                            sel.extent_line = line;
+                        if let Some(content_row) = state.content_row_from_screen(row) {
+                            let max_row = state.viewport_height().saturating_sub(1);
+                            let line = state.offset + content_row.min(max_row);
+                            if let Some(ref mut sel) = state.selection {
+                                sel.extent_line = line;
+                            }
                         }
                         let text = state.extract_selection_text();
                         state.selection = None;
+                        needs_redraw = true;
                         if !text.is_empty() {
                             let _ = write_osc52(stdout, &text);
                         }
                     }
                     _ => continue,
                 }
+                if matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ) {
+                    needs_redraw = true;
+                }
             }
-            Event::FocusGained => state.refresh_palette_from_terminal(),
-            Event::Resize(_, _) => {}
+            Event::FocusGained => {
+                state.refresh_palette_from_terminal();
+                needs_redraw = true;
+            }
+            Event::Resize(_, _) => needs_redraw = true,
             _ => continue,
         }
     }
 }
 
-fn draw<F>(stdout: &mut io::Stdout, state: &PagerState<F>) -> Result<()>
+fn draw<F, G>(stdout: &mut io::Stdout, state: &PagerState<F, G>) -> Result<()>
 where
-    F: Fn(usize, &str, &TintPalette) -> (String, PaneLayout),
+    F: Fn(usize, &str, &TintPalette, &HashMap<GapId, GapState>, usize) -> RenderedDocument,
+    G: Fn(&GapDescriptor) -> Result<Vec<String>> + Send + Sync + 'static,
 {
     let hud_lines = state.hud_lines();
-    let viewport_height = state.height.saturating_sub(hud_lines.len());
+    let sticky_row = usize::from(state.has_sticky_header());
+    let viewport_height = state.height.saturating_sub(hud_lines.len() + sticky_row);
 
     queue!(stdout, cursor::MoveTo(0, 0), Clear(ClearType::All))
         .context("failed to clear pager screen")?;
 
+    if let Some(line) = state.rendered_sticky_header_line() {
+        queue!(stdout, cursor::MoveTo(0, 0), Print(line))
+            .context("failed to draw sticky header")?;
+    }
+
     for row in 0..viewport_height {
-        queue!(stdout, cursor::MoveTo(0, row as u16)).context("failed to move cursor")?;
+        queue!(stdout, cursor::MoveTo(0, (row + sticky_row) as u16))
+            .context("failed to move cursor")?;
         if let Some(line) = state.rendered_line_at(row) {
             queue!(stdout, Print(line)).context("failed to draw line")?;
         }
@@ -336,10 +423,6 @@ where
     }
 
     stdout.flush().context("failed to flush pager screen")
-}
-
-fn line_count(output: &str) -> usize {
-    output.lines().count()
 }
 
 fn should_page_output(
@@ -785,12 +868,16 @@ fn char_width(ch: char) -> usize {
 }
 
 #[derive(Debug)]
-struct PagerState<F>
+struct PagerState<F, G>
 where
-    F: Fn(usize, &str, &TintPalette) -> (String, PaneLayout),
+    F: Fn(usize, &str, &TintPalette, &HashMap<GapId, GapState>, usize) -> RenderedDocument,
+    G: Fn(&GapDescriptor) -> Result<Vec<String>> + Send + Sync + 'static,
 {
     render: F,
+    fetch_gap: Arc<G>,
     palette: TintPalette,
+    gap_states: HashMap<GapId, GapState>,
+    line_gaps: Vec<Option<GapDescriptor>>,
     lines: Vec<String>,
     plain_lines: Vec<String>,
     offset: usize,
@@ -808,29 +895,43 @@ where
     help_open: bool,
     selection: Option<Selection>,
     pane_layout: PaneLayout,
+    gap_result_tx: Sender<GapFetchResult>,
+    gap_result_rx: Receiver<GapFetchResult>,
+    spinner_frame: usize,
+    last_spinner_tick: Instant,
 }
 
-impl<F> PagerState<F>
+impl<F, G> PagerState<F, G>
 where
-    F: Fn(usize, &str, &TintPalette) -> (String, PaneLayout),
+    F: Fn(usize, &str, &TintPalette, &HashMap<GapId, GapState>, usize) -> RenderedDocument,
+    G: Fn(&GapDescriptor) -> Result<Vec<String>> + Send + Sync + 'static,
 {
     fn new(
         render: F,
+        fetch_gap: G,
         width: usize,
         height: usize,
-        initial_output: String,
-        initial_layout: PaneLayout,
+        initial_render: RenderedDocument,
         all_files: Vec<String>,
         palette: TintPalette,
     ) -> Self {
-        let lines: Vec<String> = initial_output.lines().map(str::to_owned).collect();
+        let (gap_result_tx, gap_result_rx) = mpsc::channel();
+        let lines = initial_render.lines;
+        let line_gaps = initial_render
+            .line_metadata
+            .into_iter()
+            .map(|meta| meta.gap)
+            .collect::<Vec<_>>();
         let plain_lines = rebuild_plain_lines(&lines);
         let visible_files = all_files.clone();
         let file_headers = build_file_header_lines(&plain_lines, &visible_files);
 
         Self {
             render,
+            fetch_gap: Arc::new(fetch_gap),
             palette,
+            gap_states: HashMap::new(),
+            line_gaps,
             lines,
             plain_lines,
             offset: 0,
@@ -847,18 +948,22 @@ where
             file_filter_open: false,
             help_open: false,
             selection: None,
-            pane_layout: initial_layout,
+            pane_layout: initial_render.layout,
+            gap_result_tx,
+            gap_result_rx,
+            spinner_frame: 0,
+            last_spinner_tick: Instant::now(),
         }
     }
 
-    fn refresh_dimensions(&mut self) -> Result<()> {
+    fn refresh_dimensions(&mut self) -> Result<bool> {
         let (width, height) = terminal::size().context("failed to read terminal size")?;
-        self.set_dimensions(width as usize, height as usize);
-        Ok(())
+        Ok(self.set_dimensions(width as usize, height as usize))
     }
 
-    fn set_dimensions(&mut self, width: usize, height: usize) {
+    fn set_dimensions(&mut self, width: usize, height: usize) -> bool {
         let width_changed = self.width != width || self.lines.is_empty();
+        let height_changed = self.height != height;
         self.width = width;
         self.height = height;
 
@@ -868,15 +973,19 @@ where
         } else {
             self.clamp_offset();
         }
+
+        width_changed || height_changed
     }
 
     fn rerender(&mut self, preferred_file: Option<String>) {
-        let (output, layout) = (self.render)(self.width, &self.file_filter_query, &self.palette);
-        self.pane_layout = layout;
-        self.lines = output.lines().map(str::to_owned).collect();
-        self.plain_lines = rebuild_plain_lines(&self.lines);
-        self.visible_files = filter_file_names(&self.all_files, &self.file_filter_query);
-        self.file_headers = build_file_header_lines(&self.plain_lines, &self.visible_files);
+        let rendered = (self.render)(
+            self.width,
+            &self.file_filter_query,
+            &self.palette,
+            &self.gap_states,
+            self.spinner_frame,
+        );
+        self.apply_rendered_document(rendered);
 
         if matches!(self.search, SearchMode::Active { .. }) {
             self.refresh_search_matches();
@@ -887,8 +996,48 @@ where
         self.clamp_offset();
     }
 
+    fn rerender_preserving_scroll(&mut self, changed_gap: Option<&GapId>) {
+        let old_offset = self.offset;
+        let old_line_count = self.lines.len();
+        let old_gap_line = changed_gap.and_then(|gap_id| self.line_index_for_gap(gap_id));
+        let rendered = (self.render)(
+            self.width,
+            &self.file_filter_query,
+            &self.palette,
+            &self.gap_states,
+            self.spinner_frame,
+        );
+        self.apply_rendered_document(rendered);
+
+        if matches!(self.search, SearchMode::Active { .. }) {
+            self.refresh_search_matches_without_jumping();
+        }
+
+        let added_lines = self.lines.len().saturating_sub(old_line_count);
+        self.offset = if old_gap_line.is_some_and(|line| line < old_offset) {
+            old_offset.saturating_add(added_lines)
+        } else {
+            old_offset
+        };
+        self.clamp_offset();
+    }
+
+    fn apply_rendered_document(&mut self, rendered: RenderedDocument) {
+        self.pane_layout = rendered.layout;
+        self.line_gaps = rendered
+            .line_metadata
+            .into_iter()
+            .map(|meta| meta.gap)
+            .collect();
+        self.lines = rendered.lines;
+        self.plain_lines = rebuild_plain_lines(&self.lines);
+        self.visible_files = filter_file_names(&self.all_files, &self.file_filter_query);
+        self.file_headers = build_file_header_lines(&self.plain_lines, &self.visible_files);
+    }
+
     fn viewport_height(&self) -> usize {
-        self.height.saturating_sub(self.hud_height())
+        self.height
+            .saturating_sub(self.hud_height() + self.sticky_header_height())
     }
 
     fn hud_height(&self) -> usize {
@@ -923,6 +1072,122 @@ where
                 .content_start
                 .max(self.pane_layout.right_start),
         ))
+    }
+
+    fn has_sticky_header(&self) -> bool {
+        self.sticky_header_line().is_some()
+    }
+
+    fn sticky_header_height(&self) -> usize {
+        usize::from(self.has_sticky_header())
+    }
+
+    fn sticky_header_line(&self) -> Option<&FileHeaderLine> {
+        let index = self.current_top_file_index()?;
+        let header = self.file_headers.get(index)?;
+        (header.line < self.offset).then_some(header)
+    }
+
+    fn rendered_sticky_header_line(&self) -> Option<String> {
+        let header = self.sticky_header_line()?;
+        let line = self.lines.get(header.line)?;
+        Some(render_highlighted_line(
+            line,
+            self.horizontal_offset,
+            self.width,
+            &[],
+            self.search_bg,
+            None,
+        ))
+    }
+
+    fn content_row_from_screen(&self, row: usize) -> Option<usize> {
+        let sticky = self.sticky_header_height();
+        if row < sticky {
+            return None;
+        }
+        let content_row = row - sticky;
+        (content_row < self.viewport_height()).then_some(content_row)
+    }
+
+    fn line_index_for_gap(&self, gap_id: &GapId) -> Option<usize> {
+        self.line_gaps.iter().position(|gap| {
+            gap.as_ref()
+                .map(|descriptor| &descriptor.id == gap_id)
+                .unwrap_or(false)
+        })
+    }
+
+    fn poll_timeout(&self) -> Duration {
+        if self.has_loading_gaps() {
+            SPINNER_TICK
+        } else {
+            IDLE_POLL
+        }
+    }
+
+    fn has_loading_gaps(&self) -> bool {
+        self.gap_states
+            .values()
+            .any(|state| matches!(state, GapState::Loading))
+    }
+
+    fn try_activate_gap(&mut self, row: usize) -> bool {
+        let line_index = self.offset + row;
+        let Some(gap) = self.line_gaps.get(line_index).and_then(|gap| gap.clone()) else {
+            return false;
+        };
+
+        if matches!(self.gap_states.get(&gap.id), Some(GapState::Expanded(_))) {
+            return true;
+        }
+
+        if !matches!(self.gap_states.get(&gap.id), Some(GapState::Loading)) {
+            self.start_gap_fetch(gap);
+        }
+        true
+    }
+
+    fn start_gap_fetch(&mut self, gap: GapDescriptor) {
+        self.gap_states.insert(gap.id.clone(), GapState::Loading);
+        self.rerender_preserving_scroll(Some(&gap.id));
+
+        let sender = self.gap_result_tx.clone();
+        let fetch_gap = Arc::clone(&self.fetch_gap);
+        thread::spawn(move || {
+            let result = fetch_gap(&gap).map_err(|err| format!("{err:#}"));
+            let _ = sender.send(GapFetchResult { gap, lines: result });
+        });
+    }
+
+    fn drain_gap_fetch_results(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(result) = self.gap_result_rx.try_recv() {
+            let gap_id = result.gap.id.clone();
+            match result.lines {
+                Ok(lines) => {
+                    self.gap_states
+                        .insert(gap_id.clone(), GapState::Expanded(lines));
+                }
+                Err(_) => {
+                    self.gap_states.remove(&gap_id);
+                }
+            }
+            self.rerender_preserving_scroll(Some(&gap_id));
+            changed = true;
+        }
+        changed
+    }
+
+    fn advance_spinner_if_needed(&mut self) -> bool {
+        if !self.has_loading_gaps() || self.last_spinner_tick.elapsed() < SPINNER_TICK {
+            return false;
+        }
+
+        self.spinner_frame = self.spinner_frame.wrapping_add(1);
+        self.last_spinner_tick = Instant::now();
+        self.rerender_preserving_scroll(None);
+        true
     }
 
     fn page_up(&mut self) {
@@ -1249,6 +1514,27 @@ where
         };
         self.search_message = None;
         self.jump_to_current_match();
+    }
+
+    fn refresh_search_matches_without_jumping(&mut self) {
+        let SearchMode::Active { query, current, .. } = &self.search else {
+            return;
+        };
+
+        let query = query.clone();
+        let current = *current;
+        let matches = find_matches(&self.plain_lines, &query);
+        let current = if matches.is_empty() {
+            0
+        } else {
+            current.min(matches.len() - 1)
+        };
+        self.search = SearchMode::Active {
+            query,
+            matches,
+            current,
+        };
+        self.search_message = None;
     }
 
     fn next_match(&mut self) {
@@ -1628,14 +1914,50 @@ mod tests {
     use super::render_search_hud;
     use super::should_page_output;
     use super::strip_ansi_text;
+    use crate::render::GapDescriptor;
+    use crate::render::GapId;
+    use crate::render::GapState;
     use crate::render::PaneLayout;
+    use crate::render::RenderedDocument;
     use crate::render::TintPalette;
     use crate::terminal_palette::AnsiColor;
+    use anyhow::Result;
     use crossterm::event::KeyCode;
     use crossterm::event::KeyModifiers;
+    use std::collections::HashMap;
 
-    fn test_render(s: String) -> (String, PaneLayout) {
-        (s, PaneLayout::default())
+    fn test_render(s: String) -> RenderedDocument {
+        let lines: Vec<String> = s.lines().map(str::to_owned).collect();
+        RenderedDocument {
+            line_metadata: vec![Default::default(); lines.len()],
+            lines,
+            layout: PaneLayout::default(),
+        }
+    }
+
+    fn noop_fetch(_: &GapDescriptor) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    fn new_state<F>(
+        render: F,
+        width: usize,
+        height: usize,
+        initial: String,
+        files: Vec<String>,
+    ) -> PagerState<F, fn(&GapDescriptor) -> Result<Vec<String>>>
+    where
+        F: Fn(usize, &str, &TintPalette, &HashMap<GapId, GapState>, usize) -> RenderedDocument,
+    {
+        PagerState::new(
+            render,
+            noop_fetch as fn(&GapDescriptor) -> Result<Vec<String>>,
+            width,
+            height,
+            test_render(initial),
+            files,
+            TintPalette::default(),
+        )
     }
 
     #[test]
@@ -1674,14 +1996,12 @@ mod tests {
 
     #[test]
     fn pager_page_movement_is_page_sized() {
-        let mut state = PagerState::new(
-            |_, _, _| test_render("1\n2\n3\n4\n5\n6\n7\n8\n9\n10".into()),
+        let mut state = new_state(
+            |_, _, _, _, _| test_render("1\n2\n3\n4\n5\n6\n7\n8\n9\n10".into()),
             80,
             3,
             "1\n2\n3\n4\n5\n6\n7\n8\n9\n10".into(),
-            PaneLayout::default(),
             Vec::new(),
-            TintPalette::default(),
         );
         state.page_down();
         assert_eq!(state.offset, 3);
@@ -1691,14 +2011,12 @@ mod tests {
 
     #[test]
     fn pager_scroll_is_line_sized() {
-        let mut state = PagerState::new(
-            |_, _, _| test_render("1\n2\n3\n4\n5".into()),
+        let mut state = new_state(
+            |_, _, _, _, _| test_render("1\n2\n3\n4\n5".into()),
             80,
             2,
             "1\n2\n3\n4\n5".into(),
-            PaneLayout::default(),
             Vec::new(),
-            TintPalette::default(),
         );
         state.scroll_down(3);
         assert_eq!(state.offset, 3);
@@ -1708,14 +2026,12 @@ mod tests {
 
     #[test]
     fn rerenders_when_width_changes() {
-        let mut state = PagerState::new(
-            |width, _, _| test_render(format!("width={width}")),
+        let mut state = new_state(
+            |width, _, _, _, _| test_render(format!("width={width}")),
             80,
             10,
             "width=80".into(),
-            PaneLayout::default(),
             Vec::new(),
-            TintPalette::default(),
         );
         assert_eq!(state.line_at(0), Some("width=80"));
 
@@ -1727,14 +2043,12 @@ mod tests {
     #[test]
     fn horizontal_scroll_is_clamped_to_widest_displayed_line() {
         let line = "this is a very long line";
-        let mut state = PagerState::new(
-            |_, _, _| test_render(format!("short\n{line}")),
+        let mut state = new_state(
+            |_, _, _, _, _| test_render(format!("short\n{line}")),
             10,
             4,
             format!("short\n{line}"),
-            PaneLayout::default(),
             Vec::new(),
-            TintPalette::default(),
         );
 
         state.scroll_right();
@@ -1765,14 +2079,12 @@ mod tests {
 
     #[test]
     fn search_matches_rendered_text_without_ansi() {
-        let mut state = PagerState::new(
-            |_, _, _| test_render("\u{1b}[1malpha\u{1b}[0m\nbeta".into()),
+        let mut state = new_state(
+            |_, _, _, _, _| test_render("\u{1b}[1malpha\u{1b}[0m\nbeta".into()),
             80,
             4,
             "\u{1b}[1malpha\u{1b}[0m\nbeta".into(),
-            PaneLayout::default(),
             Vec::new(),
-            TintPalette::default(),
         );
 
         assert!(state.handle_hud_key(KeyCode::Char('/'), KeyModifiers::NONE));
@@ -1823,14 +2135,12 @@ mod tests {
 
     #[test]
     fn active_search_reserves_bottom_row_for_hud() {
-        let mut state = PagerState::new(
-            |_, _, _| test_render("a\nb\nc\nd".into()),
+        let mut state = new_state(
+            |_, _, _, _, _| test_render("a\nb\nc\nd".into()),
             80,
             4,
             "a\nb\nc\nd".into(),
-            PaneLayout::default(),
             Vec::new(),
-            TintPalette::default(),
         );
         assert!(state.handle_hud_key(KeyCode::Char('/'), KeyModifiers::NONE));
         assert!(state.handle_hud_key(KeyCode::Char('b'), KeyModifiers::NONE));
@@ -1841,14 +2151,12 @@ mod tests {
 
     #[test]
     fn search_navigation_stops_at_edges_and_reports_boundary() {
-        let mut state = PagerState::new(
-            |_, _, _| test_render("alpha\nbeta alpha\ngamma alpha".into()),
+        let mut state = new_state(
+            |_, _, _, _, _| test_render("alpha\nbeta alpha\ngamma alpha".into()),
             80,
             3,
             "alpha\nbeta alpha\ngamma alpha".into(),
-            PaneLayout::default(),
             Vec::new(),
-            TintPalette::default(),
         );
         assert!(state.handle_hud_key(KeyCode::Char('/'), KeyModifiers::NONE));
         assert!(state.handle_hud_key(KeyCode::Char('a'), KeyModifiers::NONE));
@@ -1890,8 +2198,8 @@ mod tests {
     #[test]
     fn file_filter_narrows_files_and_rerenders_output() {
         let files = vec!["a.go".into(), "b.rs".into(), "c.go".into()];
-        let mut state = PagerState::new(
-            |_, filter, _| {
+        let mut state = new_state(
+            |_, filter, _, _, _| {
                 if filter.is_empty() {
                     test_render("a.go\nbody\nb.rs\nbody\nc.go\nbody".into())
                 } else {
@@ -1901,9 +2209,7 @@ mod tests {
             80,
             10,
             "a.go\nbody\nb.rs\nbody\nc.go\nbody".into(),
-            PaneLayout::default(),
             files,
-            TintPalette::default(),
         );
 
         assert!(state.handle_hud_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
@@ -1924,14 +2230,12 @@ mod tests {
         let files = vec!["file1".into(), "file2".into()];
         let initial = "\u{1b}[1mfile1\u{1b}[0m\nx\n\u{1b}[1mfile2\u{1b}[0m\ny".to_owned();
         let rendered = initial.clone();
-        let mut state = PagerState::new(
-            |_, _, _| test_render(rendered.clone()),
+        let mut state = new_state(
+            |_, _, _, _, _| test_render(rendered.clone()),
             80,
             6,
             initial,
-            PaneLayout::default(),
             files,
-            TintPalette::default(),
         );
         assert!(state.handle_hud_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
         state.navigate_next_file();
@@ -1946,14 +2250,12 @@ mod tests {
         let files = vec!["file1".into(), "file2".into()];
         let initial = "file1\nx\nfile2\ny".to_owned();
         let rendered = initial.clone();
-        let mut state = PagerState::new(
-            |_, _, _| test_render(rendered.clone()),
+        let mut state = new_state(
+            |_, _, _, _, _| test_render(rendered.clone()),
             80,
             6,
             initial,
-            PaneLayout::default(),
             files,
-            TintPalette::default(),
         );
         assert!(state.handle_hud_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
         assert!(state.handle_hud_key(KeyCode::Down, KeyModifiers::NONE));
@@ -1964,14 +2266,12 @@ mod tests {
 
     #[test]
     fn applying_new_palette_rerenders_output() {
-        let mut state = PagerState::new(
-            |_, _, palette| test_render(format!("{:?}", palette.changed_line_bg)),
+        let mut state = new_state(
+            |_, _, palette, _, _| test_render(format!("{:?}", palette.changed_line_bg)),
             80,
             4,
             "None".into(),
-            PaneLayout::default(),
             Vec::new(),
-            TintPalette::default(),
         );
 
         state.apply_palette(
@@ -2009,20 +2309,109 @@ mod tests {
 
     #[test]
     fn question_mark_toggles_help_overlay() {
-        let mut state = PagerState::new(
-            |_, _, _| test_render("file1\nbody".into()),
+        let mut state = new_state(
+            |_, _, _, _, _| test_render("file1\nbody".into()),
             80,
             10,
             "file1\nbody".into(),
-            PaneLayout::default(),
             Vec::new(),
-            TintPalette::default(),
         );
         assert!(state.handle_hud_key(KeyCode::Char('?'), KeyModifiers::NONE));
         assert!(state.help_open);
         assert!(state.hud_cursor_position().is_none());
         assert!(state.handle_hud_key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!state.help_open);
+    }
+
+    #[test]
+    fn sticky_header_appears_after_scrolling_past_file_header() {
+        let mut state = new_state(
+            |_, _, _, _, _| test_render("\u{1b}[1mfile1\u{1b}[0m\nbody\nmore".into()),
+            80,
+            4,
+            "\u{1b}[1mfile1\u{1b}[0m\nbody\nmore".into(),
+            vec!["file1".into()],
+        );
+
+        state.offset = 1;
+
+        assert!(state.has_sticky_header());
+        assert_eq!(state.viewport_height(), 3);
+        let sticky = state.rendered_sticky_header_line().unwrap();
+        assert!(sticky.contains("\u{1b}[1mfile1\u{1b}[0m"));
+        assert_eq!(state.content_row_from_screen(0), None);
+        assert_eq!(state.content_row_from_screen(1), Some(0));
+    }
+
+    #[test]
+    fn expanding_gap_above_viewport_preserves_visible_top_line() {
+        let gap = GapDescriptor {
+            id: GapId {
+                file_path: "demo.txt".into(),
+                hunk_index: 0,
+            },
+            start_line: 1,
+            line_count: 3,
+        };
+        let initial_render = RenderedDocument {
+            lines: vec!["⋮".into(), "alpha".into(), "beta".into(), "gamma".into()],
+            line_metadata: vec![
+                crate::render::RenderedLineMetadata {
+                    gap: Some(gap.clone()),
+                },
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            ],
+            layout: PaneLayout::default(),
+        };
+        let mut state = PagerState::new(
+            |_, _, _, gap_states, _| {
+                if matches!(gap_states.get(&gap.id), Some(GapState::Expanded(_))) {
+                    RenderedDocument {
+                        lines: vec![
+                            "one".into(),
+                            "two".into(),
+                            "three".into(),
+                            "alpha".into(),
+                            "beta".into(),
+                            "gamma".into(),
+                        ],
+                        line_metadata: vec![Default::default(); 6],
+                        layout: PaneLayout::default(),
+                    }
+                } else {
+                    RenderedDocument {
+                        lines: vec!["⋮".into(), "alpha".into(), "beta".into(), "gamma".into()],
+                        line_metadata: vec![
+                            crate::render::RenderedLineMetadata {
+                                gap: Some(gap.clone()),
+                            },
+                            Default::default(),
+                            Default::default(),
+                            Default::default(),
+                        ],
+                        layout: PaneLayout::default(),
+                    }
+                }
+            },
+            noop_fetch as fn(&GapDescriptor) -> Result<Vec<String>>,
+            80,
+            2,
+            initial_render,
+            Vec::new(),
+            TintPalette::default(),
+        );
+        state.offset = 2;
+
+        state.gap_states.insert(
+            gap.id.clone(),
+            GapState::Expanded(vec!["one".into(), "two".into(), "three".into()]),
+        );
+        state.rerender_preserving_scroll(Some(&gap.id));
+
+        assert_eq!(state.offset, 4);
+        assert_eq!(state.line_at(0), Some("beta"));
     }
 
     #[test]

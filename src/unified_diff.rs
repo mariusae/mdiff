@@ -1,6 +1,9 @@
+use std::collections::HashMap;
+
 #[derive(Clone, Debug, Default)]
 pub struct Document {
     pub items: Vec<Item>,
+    git_right_blobs: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -37,11 +40,14 @@ enum RawRow {
 pub fn parse(input: &str) -> Document {
     let mut items = Vec::new();
     let mut current_header: Option<String> = None;
+    let mut current_file: Option<String> = None;
+    let mut git_right_blobs = HashMap::new();
     let mut raw_rows: Vec<RawRow> = Vec::new();
 
     for line in input.lines() {
         if let Some(path) = parse_file_header(line) {
             flush_hunk(&mut items, &mut current_header, &mut raw_rows);
+            current_file = Some(path.clone());
             items.push(Item::FileHeader(path));
             continue;
         }
@@ -76,6 +82,10 @@ pub fn parse(input: &str) -> Document {
             }
         }
 
+        if let (Some(path), Some(blob)) = (current_file.as_ref(), parse_git_right_blob(line)) {
+            git_right_blobs.insert(path.clone(), blob);
+        }
+
         if is_redundant_path_meta(line) {
             continue;
         }
@@ -85,10 +95,20 @@ pub fn parse(input: &str) -> Document {
 
     flush_hunk(&mut items, &mut current_header, &mut raw_rows);
 
-    Document { items }
+    Document {
+        items,
+        git_right_blobs,
+    }
 }
 
 impl Document {
+    pub fn from_items(items: Vec<Item>) -> Self {
+        Self {
+            items,
+            git_right_blobs: HashMap::new(),
+        }
+    }
+
     pub fn file_paths(&self) -> Vec<String> {
         self.items
             .iter()
@@ -136,7 +156,14 @@ impl Document {
             return Document::default();
         }
 
-        Document { items }
+        Document {
+            items,
+            git_right_blobs: self.git_right_blobs.clone(),
+        }
+    }
+
+    pub fn git_right_blob_by_path(&self) -> HashMap<String, String> {
+        self.git_right_blobs.clone()
     }
 }
 
@@ -185,6 +212,16 @@ fn is_redundant_path_meta(line: &str) -> bool {
         || line.starts_with("+++ ")
         || line.starts_with("index ")
         || line.starts_with("new file mode ")
+}
+
+fn parse_git_right_blob(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("index ")?;
+    let range = rest.split_whitespace().next()?;
+    let (_left, right) = range.split_once("..")?;
+    if right.chars().all(|ch| ch == '0') {
+        return None;
+    }
+    Some(right.to_owned())
 }
 
 fn flush_hunk(items: &mut Vec<Item>, header: &mut Option<String>, raw_rows: &mut Vec<RawRow>) {
@@ -272,6 +309,7 @@ mod tests {
     use super::Item;
     use super::Row;
     use super::parse;
+    use super::parse_git_right_blob;
 
     #[test]
     fn parses_context_and_change_rows() {
@@ -361,5 +399,32 @@ new file mode 100644
         assert_eq!(doc.items.len(), 2);
         assert!(matches!(&doc.items[0], Item::FileHeader(name) if name == "in.txt"));
         assert!(matches!(&doc.items[1], Item::Hunk(_)));
+    }
+
+    #[test]
+    fn extracts_git_right_blob_ids_by_file() {
+        let input = "\
+diff --git a/a.txt b/a.txt
+index 1234567..89abcde 100644
+@@ -1 +1 @@
+-a
++b
+";
+
+        let doc = parse(input);
+
+        assert_eq!(
+            doc.git_right_blob_by_path().get("a.txt"),
+            Some(&"89abcde".to_owned())
+        );
+    }
+
+    #[test]
+    fn parses_git_right_blob_from_index_line() {
+        assert_eq!(
+            parse_git_right_blob("index 1234567..89abcde 100644"),
+            Some("89abcde".to_owned())
+        );
+        assert_eq!(parse_git_right_blob("index 1234567..0000000"), None);
     }
 }

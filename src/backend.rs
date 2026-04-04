@@ -1,6 +1,8 @@
 use anyhow::Context;
 use anyhow::Result;
+use std::collections::HashMap;
 use std::ffi::OsString;
+use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -17,6 +19,15 @@ pub enum Backend {
 pub struct Detection {
     pub backend: Backend,
     pub root: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FileFetcher {
+    backend: Backend,
+    cwd: PathBuf,
+    root: Option<PathBuf>,
+    args: Vec<OsString>,
+    git_right_blobs: HashMap<String, String>,
 }
 
 pub fn detect(cwd: &Path) -> Backend {
@@ -116,6 +127,111 @@ impl Backend {
             }
         }
     }
+}
+
+impl FileFetcher {
+    pub fn new(
+        backend: Backend,
+        cwd: PathBuf,
+        root: Option<PathBuf>,
+        args: Vec<OsString>,
+        git_right_blobs: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            backend,
+            cwd,
+            root,
+            args,
+            git_right_blobs,
+        }
+    }
+
+    pub fn fetch_right_file(&self, path: &str) -> Result<String> {
+        match self.backend {
+            Backend::Git => self.fetch_git_right_file(path),
+            Backend::Hg => self.fetch_hg_right_file(path),
+            Backend::PlainDiff => fs::read_to_string(self.cwd.join(path))
+                .with_context(|| format!("failed to read {path} from disk")),
+        }
+    }
+
+    fn fetch_git_right_file(&self, path: &str) -> Result<String> {
+        if let Some(blob) = self.git_right_blobs.get(path) {
+            return self.run_in_root("git", ["show"], [blob.as_str()]);
+        }
+
+        if has_flag(&self.args, "--cached") || has_flag(&self.args, "--staged") {
+            return self.run_in_root("git", ["show"], [format!(":{path}")]);
+        }
+
+        self.read_working_tree_file(path)
+    }
+
+    fn fetch_hg_right_file(&self, path: &str) -> Result<String> {
+        if let Some(revision) = last_flag_value(&self.args, &["-r", "--rev"]) {
+            return self.run_in_root("hg", ["cat", "-r"], [revision, path.to_owned()]);
+        }
+
+        self.read_working_tree_file(path)
+    }
+
+    fn read_working_tree_file(&self, path: &str) -> Result<String> {
+        let base = self.root.as_ref().unwrap_or(&self.cwd);
+        fs::read_to_string(base.join(path))
+            .with_context(|| format!("failed to read {path} from disk"))
+    }
+
+    fn run_in_root<const N: usize, I, S>(
+        &self,
+        program: &str,
+        prefix: [&str; N],
+        args: I,
+    ) -> Result<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let mut command = Command::new(program);
+        command.args(prefix);
+        command.args(args);
+        command.current_dir(self.root.as_ref().unwrap_or(&self.cwd));
+        let output = command
+            .output()
+            .with_context(|| format!("unable to execute {program}"))?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "{program} exited with status {}",
+                output.status.code().unwrap_or(1)
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+}
+
+fn has_flag(args: &[OsString], flag: &str) -> bool {
+    args.iter().any(|arg| arg == flag)
+}
+
+fn last_flag_value(args: &[OsString], flags: &[&str]) -> Option<String> {
+    let mut result = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if flags.iter().any(|flag| arg == flag) {
+            let value = iter.next()?;
+            result = Some(value.to_string_lossy().into_owned());
+            continue;
+        }
+
+        for flag in flags {
+            let prefix = format!("{flag}=");
+            let arg_text = arg.to_string_lossy();
+            if let Some(value) = arg_text.strip_prefix(&prefix) {
+                result = Some(value.to_owned());
+                break;
+            }
+        }
+    }
+    result
 }
 
 fn shell_quote_lossy(value: &str) -> String {

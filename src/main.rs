@@ -34,7 +34,8 @@ fn run() -> Result<i32> {
         return rage::run(&cwd, &args);
     }
 
-    let backend = backend::detect(&cwd);
+    let detection = backend::detect_details(&cwd);
+    let backend = detection.backend;
     let output = backend
         .run(&args)
         .with_context(|| format!("failed to run {}", backend.describe()))?;
@@ -48,16 +49,40 @@ fn run() -> Result<i32> {
     let raw_stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let document = unified_diff::parse(&raw_stdout);
     let files = document.file_paths();
-    let rendered = pager::page_or_render(files, force_pager, |width, file_filter, palette| {
-        let filtered = document.filter_files(file_filter);
-        let layout = render::pane_layout(&filtered, width);
-        let output = if render::should_render_side_by_side(width) {
-            render::render_document(&filtered, width, palette)
-        } else {
-            render::render_inline_document(&filtered, width, palette)
-        };
-        (output, layout)
-    })?;
+    let fetcher = backend::FileFetcher::new(
+        backend,
+        cwd,
+        detection.root,
+        args.clone(),
+        document.git_right_blob_by_path(),
+    );
+    let rendered = pager::page_or_render(
+        files,
+        force_pager,
+        |width, file_filter, palette, gap_states, spinner_frame| {
+            let filtered = document.filter_files(file_filter);
+            if render::should_render_side_by_side(width) {
+                render::render_document_with_state(
+                    &filtered,
+                    width,
+                    palette,
+                    gap_states,
+                    spinner_frame,
+                )
+            } else {
+                render::render_inline_document_with_state(
+                    &filtered,
+                    palette,
+                    gap_states,
+                    spinner_frame,
+                )
+            }
+        },
+        move |gap| {
+            let content = fetcher.fetch_right_file(&gap.id.file_path)?;
+            Ok(slice_lines(&content, gap.start_line, gap.line_count))
+        },
+    )?;
 
     if let Some(rendered) = rendered {
         io::stdout()
@@ -77,8 +102,18 @@ fn take_flag(args: &mut Vec<OsString>, flag: &OsStr) -> bool {
     args.len() != original_len
 }
 
+fn slice_lines(content: &str, start_line: usize, line_count: usize) -> Vec<String> {
+    content
+        .lines()
+        .skip(start_line.saturating_sub(1))
+        .take(line_count)
+        .map(str::to_owned)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    use super::slice_lines;
     use super::take_flag;
     use std::ffi::OsStr;
     use std::ffi::OsString;
@@ -125,6 +160,14 @@ mod tests {
         assert_eq!(
             args,
             vec![OsString::from("--cached"), OsString::from("--stat")]
+        );
+    }
+
+    #[test]
+    fn slices_requested_line_range() {
+        assert_eq!(
+            slice_lines("one\ntwo\nthree\nfour\n", 2, 2),
+            vec!["two".to_owned(), "three".to_owned()]
         );
     }
 }
