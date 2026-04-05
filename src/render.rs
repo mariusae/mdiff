@@ -723,17 +723,16 @@ fn render_inline_deleted_line(
     line_number_width: usize,
     palette: &TintPalette,
 ) -> String {
-    let content = if palette.changed_line_bg.is_some() {
-        let prefix = format!("{line_number:>line_number_width$}  ");
-        format!("{prefix}{}", expand_tabs(text))
+    let expanded = expand_tabs(text);
+    let prefix = if palette.changed_line_bg.is_some() {
+        format!("{line_number:>line_number_width$}  ")
     } else {
-        let prefix = format!("{line_number:>line_number_width$} -");
-        format!("{prefix}{}", expand_tabs(text))
+        format!("{line_number:>line_number_width$} -")
     };
     if let Some(bg) = palette.changed_line_bg {
-        format!("{}{content}\u{1b}[0m", ansi_bg(bg))
+        format!("{}{prefix}\u{1b}[2m{expanded}\u{1b}[0m", ansi_bg(bg))
     } else {
-        content
+        format!("{prefix}\u{1b}[2m{expanded}\u{1b}[0m")
     }
 }
 
@@ -1142,8 +1141,10 @@ mod tests {
         assert!(rendered.contains("\u{1b}[1msrc/unified_diff.rs\u{1b}[0m"));
         assert!(rendered.contains("   ⋮"));
         assert!(rendered.contains("  15      pub old_start: usize,"));
-        // deleted lines have tinted background
-        assert!(rendered.contains("\u{1b}[48;5;240m"));
+        // deleted lines keep the tinted background and dim the removed text payload
+        assert!(
+            rendered.contains("\u{1b}[48;5;240m  16  \u{1b}[2m    pub old_len: usize,\u{1b}[0m")
+        );
         assert!(rendered.contains("  16  "));
         assert!(rendered.contains("  16      pub new_start: usize,"));
         assert!(rendered.contains(" 127  "));
