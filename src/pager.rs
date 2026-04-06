@@ -150,6 +150,8 @@ pub fn page_or_render<F, G>(
     force_pager: bool,
     render: F,
     fetch_gap: G,
+    list_files: impl Fn() -> Vec<String> + Send + Sync + 'static,
+    refresh_rx: Option<Receiver<()>>,
 ) -> Result<Option<String>>
 where
     F: Fn(usize, &str, &TintPalette, &HashMap<GapId, GapState>, usize) -> RenderedDocument,
@@ -177,6 +179,8 @@ where
         files,
         render,
         fetch_gap,
+        list_files,
+        refresh_rx,
         width,
         rows,
         initial_render,
@@ -185,10 +189,12 @@ where
     Ok(None)
 }
 
-fn page<F, G>(
+fn page<F, G, H>(
     files: Vec<String>,
     render: F,
     fetch_gap: G,
+    list_files: H,
+    refresh_rx: Option<Receiver<()>>,
     width: usize,
     height: usize,
     initial_render: RenderedDocument,
@@ -197,11 +203,14 @@ fn page<F, G>(
 where
     F: Fn(usize, &str, &TintPalette, &HashMap<GapId, GapState>, usize) -> RenderedDocument,
     G: Fn(&GapDescriptor) -> Result<Vec<String>> + Send + Sync + 'static,
+    H: Fn() -> Vec<String> + Send + Sync + 'static,
 {
     let mut stdout = io::stdout();
     let mut state = PagerState::new(
         render,
         fetch_gap,
+        list_files,
+        refresh_rx,
         width,
         height,
         initial_render,
@@ -234,15 +243,19 @@ where
     result
 }
 
-fn run_pager<F, G>(stdout: &mut io::Stdout, state: &mut PagerState<F, G>) -> Result<()>
+fn run_pager<F, G, H>(stdout: &mut io::Stdout, state: &mut PagerState<F, G, H>) -> Result<()>
 where
     F: Fn(usize, &str, &TintPalette, &HashMap<GapId, GapState>, usize) -> RenderedDocument,
     G: Fn(&GapDescriptor) -> Result<Vec<String>> + Send + Sync + 'static,
+    H: Fn() -> Vec<String> + Send + Sync + 'static,
 {
     let mut needs_redraw = true;
 
     loop {
         if state.refresh_dimensions()? {
+            needs_redraw = true;
+        }
+        if state.drain_live_refresh() {
             needs_redraw = true;
         }
         if state.drain_gap_fetch_results() {
@@ -371,10 +384,11 @@ where
     }
 }
 
-fn draw<F, G>(stdout: &mut io::Stdout, state: &PagerState<F, G>) -> Result<()>
+fn draw<F, G, H>(stdout: &mut io::Stdout, state: &PagerState<F, G, H>) -> Result<()>
 where
     F: Fn(usize, &str, &TintPalette, &HashMap<GapId, GapState>, usize) -> RenderedDocument,
     G: Fn(&GapDescriptor) -> Result<Vec<String>> + Send + Sync + 'static,
+    H: Fn() -> Vec<String> + Send + Sync + 'static,
 {
     let hud_lines = state.hud_lines();
     let sticky_row = usize::from(state.has_sticky_header());
@@ -868,13 +882,15 @@ fn char_width(ch: char) -> usize {
 }
 
 #[derive(Debug)]
-struct PagerState<F, G>
+struct PagerState<F, G, H>
 where
     F: Fn(usize, &str, &TintPalette, &HashMap<GapId, GapState>, usize) -> RenderedDocument,
     G: Fn(&GapDescriptor) -> Result<Vec<String>> + Send + Sync + 'static,
+    H: Fn() -> Vec<String> + Send + Sync + 'static,
 {
     render: F,
     fetch_gap: Arc<G>,
+    list_files: Arc<H>,
     palette: TintPalette,
     gap_states: HashMap<GapId, GapState>,
     line_gaps: Vec<Option<GapDescriptor>>,
@@ -897,18 +913,22 @@ where
     pane_layout: PaneLayout,
     gap_result_tx: Sender<GapFetchResult>,
     gap_result_rx: Receiver<GapFetchResult>,
+    refresh_rx: Option<Receiver<()>>,
     spinner_frame: usize,
     last_spinner_tick: Instant,
 }
 
-impl<F, G> PagerState<F, G>
+impl<F, G, H> PagerState<F, G, H>
 where
     F: Fn(usize, &str, &TintPalette, &HashMap<GapId, GapState>, usize) -> RenderedDocument,
     G: Fn(&GapDescriptor) -> Result<Vec<String>> + Send + Sync + 'static,
+    H: Fn() -> Vec<String> + Send + Sync + 'static,
 {
     fn new(
         render: F,
         fetch_gap: G,
+        list_files: H,
+        refresh_rx: Option<Receiver<()>>,
         width: usize,
         height: usize,
         initial_render: RenderedDocument,
@@ -929,6 +949,7 @@ where
         Self {
             render,
             fetch_gap: Arc::new(fetch_gap),
+            list_files: Arc::new(list_files),
             palette,
             gap_states: HashMap::new(),
             line_gaps,
@@ -951,6 +972,7 @@ where
             pane_layout: initial_render.layout,
             gap_result_tx,
             gap_result_rx,
+            refresh_rx,
             spinner_frame: 0,
             last_spinner_tick: Instant::now(),
         }
@@ -1031,8 +1053,26 @@ where
             .collect();
         self.lines = rendered.lines;
         self.plain_lines = rebuild_plain_lines(&self.lines);
+        self.all_files = (self.list_files)();
         self.visible_files = filter_file_names(&self.all_files, &self.file_filter_query);
         self.file_headers = build_file_header_lines(&self.plain_lines, &self.visible_files);
+    }
+
+    fn drain_live_refresh(&mut self) -> bool {
+        let Some(refresh_rx) = self.refresh_rx.as_ref() else {
+            return false;
+        };
+
+        let mut changed = false;
+        while refresh_rx.try_recv().is_ok() {
+            changed = true;
+        }
+
+        if changed {
+            self.rerender_preserving_scroll(None);
+        }
+
+        changed
     }
 
     fn viewport_height(&self) -> usize {
@@ -1946,13 +1986,20 @@ mod tests {
         height: usize,
         initial: String,
         files: Vec<String>,
-    ) -> PagerState<F, fn(&GapDescriptor) -> Result<Vec<String>>>
+    ) -> PagerState<
+        F,
+        fn(&GapDescriptor) -> Result<Vec<String>>,
+        Box<dyn Fn() -> Vec<String> + Send + Sync>,
+    >
     where
         F: Fn(usize, &str, &TintPalette, &HashMap<GapId, GapState>, usize) -> RenderedDocument,
     {
+        let listed_files = files.clone();
         PagerState::new(
             render,
             noop_fetch as fn(&GapDescriptor) -> Result<Vec<String>>,
+            Box::new(move || listed_files.clone()),
+            None,
             width,
             height,
             test_render(initial),
@@ -2397,6 +2444,8 @@ mod tests {
                 }
             },
             noop_fetch as fn(&GapDescriptor) -> Result<Vec<String>>,
+            Box::new(Vec::new),
+            None,
             80,
             2,
             initial_render,

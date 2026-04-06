@@ -8,11 +8,27 @@ mod unified_diff;
 
 use anyhow::Context;
 use anyhow::Result;
+use notify::RecommendedWatcher;
+use notify::RecursiveMode;
+use notify::Watcher;
 use std::env;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io;
 use std::io::Write;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
+#[derive(Clone)]
+struct DiffSnapshot {
+    raw_stdout: String,
+    document: unified_diff::Document,
+    files: Vec<String>,
+}
 
 fn main() {
     match run() {
@@ -49,18 +65,29 @@ fn run() -> Result<i32> {
     let raw_stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let document = unified_diff::parse(&raw_stdout);
     let files = document.file_paths();
-    let fetcher = backend::FileFetcher::new(
+    let snapshot = Arc::new(Mutex::new(DiffSnapshot {
+        raw_stdout: raw_stdout.clone(),
+        document,
+        files: files.clone(),
+    }));
+    let fetch_cwd = cwd.clone();
+    let fetch_root = detection.root.clone();
+    let fetch_args = args.clone();
+    let refresh_rx = spawn_live_refresh(
         backend,
-        cwd,
-        detection.root,
+        detection.root.clone().unwrap_or_else(|| cwd.clone()),
         args.clone(),
-        document.git_right_blob_by_path(),
+        Arc::clone(&snapshot),
     );
+    let render_snapshot = Arc::clone(&snapshot);
+    let fetch_snapshot = Arc::clone(&snapshot);
+    let list_snapshot = Arc::clone(&snapshot);
     let rendered = pager::page_or_render(
         files,
         force_pager,
         |width, file_filter, palette, gap_states, spinner_frame| {
-            let filtered = document.filter_files(file_filter);
+            let snapshot = render_snapshot.lock().expect("snapshot lock poisoned");
+            let filtered = snapshot.document.filter_files(file_filter);
             if render::should_render_side_by_side(width) {
                 render::render_document_with_state(
                     &filtered,
@@ -79,9 +106,25 @@ fn run() -> Result<i32> {
             }
         },
         move |gap| {
+            let git_right_blobs = fetch_snapshot
+                .lock()
+                .expect("snapshot lock poisoned")
+                .document
+                .git_right_blob_by_path();
+            let fetcher = backend::FileFetcher::new(
+                backend,
+                fetch_cwd.clone(),
+                fetch_root.clone(),
+                fetch_args.clone(),
+                git_right_blobs,
+            );
             let content = fetcher.fetch_right_file(&gap.id.file_path)?;
             Ok(slice_lines(&content, gap.start_line, gap.line_count))
         },
+        {
+            move || list_snapshot.lock().expect("snapshot lock poisoned").files.clone()
+        },
+        refresh_rx,
     )?;
 
     if let Some(rendered) = rendered {
@@ -100,6 +143,100 @@ fn take_flag(args: &mut Vec<OsString>, flag: &OsStr) -> bool {
     let original_len = args.len();
     args.retain(|arg| arg != flag);
     args.len() != original_len
+}
+
+fn spawn_live_refresh(
+    backend: backend::Backend,
+    watch_root: PathBuf,
+    args: Vec<OsString>,
+    snapshot: Arc<Mutex<DiffSnapshot>>,
+) -> Option<mpsc::Receiver<()>> {
+    let config = backend.live_refresh_config(&watch_root, Some(&watch_root), &args)?;
+    let (refresh_tx, refresh_rx) = mpsc::channel();
+
+    thread::spawn(move || match config.mode {
+        backend::LiveRefreshMode::WatchRecursive => {
+            run_watch_refresh_loop(backend, watch_root, args, snapshot, refresh_tx, config.poll_interval)
+        }
+        backend::LiveRefreshMode::Poll => {
+            run_poll_refresh_loop(backend, args, snapshot, refresh_tx, config.poll_interval)
+        }
+    });
+
+    Some(refresh_rx)
+}
+
+fn run_watch_refresh_loop(
+    backend: backend::Backend,
+    watch_root: PathBuf,
+    args: Vec<OsString>,
+    snapshot: Arc<Mutex<DiffSnapshot>>,
+    refresh_tx: mpsc::Sender<()>,
+    debounce: Duration,
+) {
+    let (event_tx, event_rx) = mpsc::channel();
+    let mut watcher = match RecommendedWatcher::new(
+        move |result: notify::Result<notify::Event>| {
+            if result.is_ok() {
+                let _ = event_tx.send(());
+            }
+        },
+        notify::Config::default(),
+    ) {
+        Ok(watcher) => watcher,
+        Err(_) => {
+            run_poll_refresh_loop(backend, args, snapshot, refresh_tx, debounce);
+            return;
+        }
+    };
+
+    if watcher.watch(&watch_root, RecursiveMode::Recursive).is_err() {
+        run_poll_refresh_loop(backend, args, snapshot, refresh_tx, debounce);
+        return;
+    }
+
+    loop {
+        if event_rx.recv().is_err() {
+            return;
+        }
+        while event_rx.recv_timeout(debounce).is_ok() {}
+        let _ = refresh_snapshot_if_changed(backend, &args, &snapshot, &refresh_tx);
+    }
+}
+
+fn run_poll_refresh_loop(
+    backend: backend::Backend,
+    args: Vec<OsString>,
+    snapshot: Arc<Mutex<DiffSnapshot>>,
+    refresh_tx: mpsc::Sender<()>,
+    interval: Duration,
+) {
+    loop {
+        thread::sleep(interval);
+        let _ = refresh_snapshot_if_changed(backend, &args, &snapshot, &refresh_tx);
+    }
+}
+
+fn refresh_snapshot_if_changed(
+    backend: backend::Backend,
+    args: &[OsString],
+    snapshot: &Arc<Mutex<DiffSnapshot>>,
+    refresh_tx: &mpsc::Sender<()>,
+) -> Result<()> {
+    let output = backend.run(args)?;
+    let raw_stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    let mut snapshot = snapshot.lock().expect("snapshot lock poisoned");
+    if snapshot.raw_stdout == raw_stdout {
+        return Ok(());
+    }
+
+    let document = unified_diff::parse(&raw_stdout);
+    snapshot.files = document.file_paths();
+    snapshot.document = document;
+    snapshot.raw_stdout = raw_stdout;
+    let _ = refresh_tx.send(());
+    Ok(())
 }
 
 fn slice_lines(content: &str, start_line: usize, line_count: usize) -> Vec<String> {

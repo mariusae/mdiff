@@ -1,5 +1,6 @@
 use anyhow::Context;
 use anyhow::Result;
+use std::time::Duration;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
@@ -28,6 +29,19 @@ pub struct FileFetcher {
     root: Option<PathBuf>,
     args: Vec<OsString>,
     git_right_blobs: HashMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveRefreshMode {
+    WatchRecursive,
+    Poll,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveRefreshConfig {
+    pub mode: LiveRefreshMode,
+    pub watch_root: PathBuf,
+    pub poll_interval: Duration,
 }
 
 pub fn detect(cwd: &Path) -> Backend {
@@ -70,6 +84,30 @@ impl Backend {
         command
             .output()
             .with_context(|| format!("unable to execute {}", self.describe()))
+    }
+
+    pub fn live_refresh_config(
+        self,
+        cwd: &Path,
+        root: Option<&Path>,
+        args: &[OsString],
+    ) -> Option<LiveRefreshConfig> {
+        if !matches!(self, Self::Git | Self::Hg) || !args.is_empty() {
+            return None;
+        }
+
+        let watch_root = root.unwrap_or(cwd).to_path_buf();
+        let mode = if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+            LiveRefreshMode::WatchRecursive
+        } else {
+            LiveRefreshMode::Poll
+        };
+
+        Some(LiveRefreshConfig {
+            mode,
+            watch_root,
+            poll_interval: Duration::from_millis(500),
+        })
     }
 
     pub fn command_preview(self, args: &[OsString]) -> String {
@@ -252,8 +290,10 @@ fn shell_quote_lossy(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::Backend;
+    use super::LiveRefreshMode;
     use super::detect;
     use super::detect_details;
+    use std::ffi::OsString;
     use std::fs;
     use tempfile::TempDir;
 
@@ -295,5 +335,34 @@ mod tests {
         let detection = detect_details(&inner);
         assert_eq!(detection.backend, Backend::Git);
         assert_eq!(detection.root.as_deref(), Some(temp.path()));
+    }
+
+    #[test]
+    fn enables_live_refresh_for_naked_git_diff() {
+        let temp = TempDir::new().unwrap();
+        let config = Backend::Git.live_refresh_config(temp.path(), Some(temp.path()), &[]);
+        assert!(config.is_some());
+    }
+
+    #[test]
+    fn disables_live_refresh_for_explicit_diff_args() {
+        let temp = TempDir::new().unwrap();
+        let config =
+            Backend::Git.live_refresh_config(temp.path(), Some(temp.path()), &[OsString::from("HEAD")]);
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn uses_poll_refresh_on_linux() {
+        let temp = TempDir::new().unwrap();
+        let config = Backend::Hg
+            .live_refresh_config(temp.path(), Some(temp.path()), &[])
+            .unwrap();
+
+        if cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+            assert_eq!(config.mode, LiveRefreshMode::WatchRecursive);
+        } else {
+            assert_eq!(config.mode, LiveRefreshMode::Poll);
+        }
     }
 }
