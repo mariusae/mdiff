@@ -374,7 +374,7 @@ where
                     needs_redraw = true;
                 }
             }
-            Event::FocusGained => {
+            Event::FocusGained | Event::FocusLost => {
                 state.refresh_palette_from_terminal();
                 needs_redraw = true;
             }
