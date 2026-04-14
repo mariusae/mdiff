@@ -11,6 +11,7 @@ use anyhow::Result;
 use notify::RecommendedWatcher;
 use notify::RecursiveMode;
 use notify::Watcher;
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
 use std::ffi::OsString;
@@ -28,6 +29,7 @@ struct DiffSnapshot {
     raw_stdout: String,
     document: unified_diff::Document,
     files: Vec<String>,
+    file_line_counts: HashMap<String, usize>,
 }
 
 fn main() {
@@ -63,13 +65,15 @@ fn run() -> Result<i32> {
     }
 
     let raw_stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let document = unified_diff::parse(&raw_stdout);
-    let files = document.file_paths();
-    let snapshot = Arc::new(Mutex::new(DiffSnapshot {
-        raw_stdout: raw_stdout.clone(),
-        document,
-        files: files.clone(),
-    }));
+    let initial_snapshot = build_snapshot(
+        raw_stdout,
+        backend,
+        &cwd,
+        detection.root.as_ref(),
+        &args,
+    );
+    let files = initial_snapshot.files.clone();
+    let snapshot = Arc::new(Mutex::new(initial_snapshot));
     let fetch_cwd = cwd.clone();
     let fetch_root = detection.root.clone();
     let fetch_args = args.clone();
@@ -77,6 +81,8 @@ fn run() -> Result<i32> {
         backend,
         detection.root.clone().unwrap_or_else(|| cwd.clone()),
         args.clone(),
+        cwd.clone(),
+        detection.root.clone(),
         Arc::clone(&snapshot),
     );
     let render_snapshot = Arc::clone(&snapshot);
@@ -89,17 +95,19 @@ fn run() -> Result<i32> {
             let snapshot = render_snapshot.lock().expect("snapshot lock poisoned");
             let filtered = snapshot.document.filter_files(file_filter);
             if render::should_render_side_by_side(width) {
-                render::render_document_with_state(
+                render::render_document_with_state_and_file_counts(
                     &filtered,
                     width,
                     palette,
+                    &snapshot.file_line_counts,
                     gap_states,
                     spinner_frame,
                 )
             } else {
-                render::render_inline_document_with_state(
+                render::render_inline_document_with_state_and_file_counts(
                     &filtered,
                     palette,
+                    &snapshot.file_line_counts,
                     gap_states,
                     spinner_frame,
                 )
@@ -122,7 +130,13 @@ fn run() -> Result<i32> {
             Ok(slice_lines(&content, gap.start_line, gap.line_count))
         },
         {
-            move || list_snapshot.lock().expect("snapshot lock poisoned").files.clone()
+            move || {
+                list_snapshot
+                    .lock()
+                    .expect("snapshot lock poisoned")
+                    .files
+                    .clone()
+            }
         },
         refresh_rx,
     )?;
@@ -149,18 +163,33 @@ fn spawn_live_refresh(
     backend: backend::Backend,
     watch_root: PathBuf,
     args: Vec<OsString>,
+    cwd: PathBuf,
+    root: Option<PathBuf>,
     snapshot: Arc<Mutex<DiffSnapshot>>,
 ) -> Option<mpsc::Receiver<()>> {
     let config = backend.live_refresh_config(&watch_root, Some(&watch_root), &args)?;
     let (refresh_tx, refresh_rx) = mpsc::channel();
 
     thread::spawn(move || match config.mode {
-        backend::LiveRefreshMode::WatchRecursive => {
-            run_watch_refresh_loop(backend, watch_root, args, snapshot, refresh_tx, config.poll_interval)
-        }
-        backend::LiveRefreshMode::Poll => {
-            run_poll_refresh_loop(backend, args, snapshot, refresh_tx, config.poll_interval)
-        }
+        backend::LiveRefreshMode::WatchRecursive => run_watch_refresh_loop(
+            backend,
+            watch_root,
+            args,
+            cwd,
+            root,
+            snapshot,
+            refresh_tx,
+            config.poll_interval,
+        ),
+        backend::LiveRefreshMode::Poll => run_poll_refresh_loop(
+            backend,
+            args,
+            cwd,
+            root,
+            snapshot,
+            refresh_tx,
+            config.poll_interval,
+        ),
     });
 
     Some(refresh_rx)
@@ -170,6 +199,8 @@ fn run_watch_refresh_loop(
     backend: backend::Backend,
     watch_root: PathBuf,
     args: Vec<OsString>,
+    cwd: PathBuf,
+    root: Option<PathBuf>,
     snapshot: Arc<Mutex<DiffSnapshot>>,
     refresh_tx: mpsc::Sender<()>,
     debounce: Duration,
@@ -185,13 +216,16 @@ fn run_watch_refresh_loop(
     ) {
         Ok(watcher) => watcher,
         Err(_) => {
-            run_poll_refresh_loop(backend, args, snapshot, refresh_tx, debounce);
+            run_poll_refresh_loop(backend, args, cwd, root, snapshot, refresh_tx, debounce);
             return;
         }
     };
 
-    if watcher.watch(&watch_root, RecursiveMode::Recursive).is_err() {
-        run_poll_refresh_loop(backend, args, snapshot, refresh_tx, debounce);
+    if watcher
+        .watch(&watch_root, RecursiveMode::Recursive)
+        .is_err()
+    {
+        run_poll_refresh_loop(backend, args, cwd, root, snapshot, refresh_tx, debounce);
         return;
     }
 
@@ -200,25 +234,87 @@ fn run_watch_refresh_loop(
             return;
         }
         while event_rx.recv_timeout(debounce).is_ok() {}
-        let _ = refresh_snapshot_if_changed(backend, &args, &snapshot, &refresh_tx);
+        let _ = refresh_snapshot_if_changed(
+            backend,
+            &cwd,
+            root.as_ref(),
+            &args,
+            &snapshot,
+            &refresh_tx,
+        );
     }
 }
 
 fn run_poll_refresh_loop(
     backend: backend::Backend,
     args: Vec<OsString>,
+    cwd: PathBuf,
+    root: Option<PathBuf>,
     snapshot: Arc<Mutex<DiffSnapshot>>,
     refresh_tx: mpsc::Sender<()>,
     interval: Duration,
 ) {
     loop {
         thread::sleep(interval);
-        let _ = refresh_snapshot_if_changed(backend, &args, &snapshot, &refresh_tx);
+        let _ = refresh_snapshot_if_changed(
+            backend,
+            &cwd,
+            root.as_ref(),
+            &args,
+            &snapshot,
+            &refresh_tx,
+        );
     }
+}
+
+fn build_snapshot(
+    raw_stdout: String,
+    backend: backend::Backend,
+    cwd: &PathBuf,
+    root: Option<&PathBuf>,
+    args: &[OsString],
+) -> DiffSnapshot {
+    let document = unified_diff::parse(&raw_stdout);
+    let files = document.file_paths();
+    let file_line_counts = build_file_line_counts(backend, cwd, root, args, &document, &files);
+    DiffSnapshot {
+        raw_stdout,
+        document,
+        files,
+        file_line_counts,
+    }
+}
+
+fn build_file_line_counts(
+    backend: backend::Backend,
+    cwd: &PathBuf,
+    root: Option<&PathBuf>,
+    args: &[OsString],
+    document: &unified_diff::Document,
+    files: &[String],
+) -> HashMap<String, usize> {
+    let fetcher = backend::FileFetcher::new(
+        backend,
+        cwd.clone(),
+        root.cloned(),
+        args.to_vec(),
+        document.git_right_blob_by_path(),
+    );
+
+    files.iter()
+        .filter_map(|path| {
+            fetcher
+                .fetch_right_file(path)
+                .ok()
+                .map(|content| (path.clone(), content.lines().count()))
+        })
+        .collect()
 }
 
 fn refresh_snapshot_if_changed(
     backend: backend::Backend,
+    cwd: &PathBuf,
+    root: Option<&PathBuf>,
     args: &[OsString],
     snapshot: &Arc<Mutex<DiffSnapshot>>,
     refresh_tx: &mpsc::Sender<()>,
@@ -231,10 +327,7 @@ fn refresh_snapshot_if_changed(
         return Ok(());
     }
 
-    let document = unified_diff::parse(&raw_stdout);
-    snapshot.files = document.file_paths();
-    snapshot.document = document;
-    snapshot.raw_stdout = raw_stdout;
+    *snapshot = build_snapshot(raw_stdout, backend, cwd, root, args);
     let _ = refresh_tx.send(());
     Ok(())
 }
