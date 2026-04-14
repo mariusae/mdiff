@@ -1,6 +1,5 @@
 use anyhow::Context;
 use anyhow::Result;
-use std::time::Duration;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
@@ -8,6 +7,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Backend {
@@ -194,12 +194,16 @@ impl FileFetcher {
     }
 
     fn fetch_git_right_file(&self, path: &str) -> Result<String> {
-        if let Some(blob) = self.git_right_blobs.get(path) {
-            return self.run_in_root("git", ["show"], [blob.as_str()]);
-        }
-
         if has_flag(&self.args, "--cached") || has_flag(&self.args, "--staged") {
             return self.run_in_root("git", ["show"], [format!(":{path}")]);
+        }
+
+        if git_diff_uses_working_tree(self.root.as_deref().unwrap_or(&self.cwd), &self.args) {
+            return self.read_working_tree_file(path);
+        }
+
+        if let Some(blob) = self.git_right_blobs.get(path) {
+            return self.run_in_root("git", ["show"], [blob.as_str()]);
         }
 
         self.read_working_tree_file(path)
@@ -250,6 +254,32 @@ fn has_flag(args: &[OsString], flag: &str) -> bool {
     args.iter().any(|arg| arg == flag)
 }
 
+fn git_diff_uses_working_tree(base: &Path, args: &[OsString]) -> bool {
+    let mut after_separator = false;
+    let mut positional = Vec::new();
+
+    for arg in args {
+        let text = arg.to_string_lossy();
+        if after_separator {
+            return true;
+        }
+        if text == "--" {
+            after_separator = true;
+            continue;
+        }
+        if text.starts_with('-') {
+            continue;
+        }
+        positional.push(text.into_owned());
+    }
+
+    if positional.len() <= 1 {
+        return true;
+    }
+
+    positional.into_iter().any(|arg| base.join(arg).exists())
+}
+
 fn last_flag_value(args: &[OsString], flags: &[&str]) -> Option<String> {
     let mut result = None;
     let mut iter = args.iter();
@@ -293,6 +323,7 @@ mod tests {
     use super::LiveRefreshMode;
     use super::detect;
     use super::detect_details;
+    use super::git_diff_uses_working_tree;
     use std::ffi::OsString;
     use std::fs;
     use tempfile::TempDir;
@@ -347,8 +378,11 @@ mod tests {
     #[test]
     fn disables_live_refresh_for_explicit_diff_args() {
         let temp = TempDir::new().unwrap();
-        let config =
-            Backend::Git.live_refresh_config(temp.path(), Some(temp.path()), &[OsString::from("HEAD")]);
+        let config = Backend::Git.live_refresh_config(
+            temp.path(),
+            Some(temp.path()),
+            &[OsString::from("HEAD")],
+        );
         assert!(config.is_none());
     }
 
@@ -364,5 +398,49 @@ mod tests {
         } else {
             assert_eq!(config.mode, LiveRefreshMode::Poll);
         }
+    }
+
+    #[test]
+    fn treats_empty_args_as_working_tree_diff() {
+        let temp = TempDir::new().unwrap();
+        assert!(git_diff_uses_working_tree(temp.path(), &[]));
+    }
+
+    #[test]
+    fn recognizes_pathspec_git_diff_as_working_tree() {
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("src_backend.rs"), "").unwrap();
+        assert!(git_diff_uses_working_tree(
+            temp.path(),
+            &[OsString::from("--"), OsString::from("src_backend.rs"),]
+        ));
+    }
+
+    #[test]
+    fn single_revision_still_uses_working_tree() {
+        let temp = TempDir::new().unwrap();
+        assert!(git_diff_uses_working_tree(
+            temp.path(),
+            &[OsString::from("HEAD~1")]
+        ));
+    }
+
+    #[test]
+    fn revision_range_does_not_use_working_tree() {
+        let temp = TempDir::new().unwrap();
+        assert!(!git_diff_uses_working_tree(
+            temp.path(),
+            &[OsString::from("HEAD~1"), OsString::from("HEAD")]
+        ));
+    }
+
+    #[test]
+    fn revision_plus_existing_path_uses_working_tree() {
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("src_backend.rs"), "").unwrap();
+        assert!(git_diff_uses_working_tree(
+            temp.path(),
+            &[OsString::from("HEAD"), OsString::from("src_backend.rs")]
+        ));
     }
 }

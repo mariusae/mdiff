@@ -1,4 +1,6 @@
+use crate::render::ExpandedGapState;
 use crate::render::GapDescriptor;
+use crate::render::GapExpandRequest;
 use crate::render::GapId;
 use crate::render::GapState;
 use crate::render::PaneLayout;
@@ -42,6 +44,7 @@ use unicode_width::UnicodeWidthChar;
 
 const MOUSE_SCROLL_LINES: usize = 3;
 const HORIZONTAL_SCROLL_COLUMNS: usize = 8;
+const GAP_PARTIAL_EXPANSION_LINES: usize = 15;
 const SPINNER_TICK: Duration = Duration::from_millis(80);
 const IDLE_POLL: Duration = Duration::from_millis(250);
 const FILE_FILTER_PROMPT: &str = "› ";
@@ -142,6 +145,7 @@ struct Selection {
 
 struct GapFetchResult {
     gap: GapDescriptor,
+    request: GapExpandRequest,
     lines: Result<Vec<String>, String>,
 }
 
@@ -323,12 +327,12 @@ where
                     MouseEventKind::Down(MouseButton::Left) => {
                         let row = mouse.row as usize;
                         if let Some(content_row) = state.content_row_from_screen(row) {
-                            if state.try_activate_gap(content_row) {
+                            let content_col = state.horizontal_offset + mouse.column as usize;
+                            if state.try_activate_gap(content_row, content_col, MouseButton::Left) {
                                 needs_redraw = true;
                                 continue;
                             }
                             let line = state.offset + content_row;
-                            let content_col = state.horizontal_offset + mouse.column as usize;
                             let pane = state.pane_at_column(content_col);
                             state.selection = Some(Selection {
                                 pane,
@@ -336,6 +340,16 @@ where
                                 extent_line: line,
                             });
                             needs_redraw = true;
+                        }
+                    }
+                    MouseEventKind::Down(MouseButton::Right) => {
+                        let row = mouse.row as usize;
+                        if let Some(content_row) = state.content_row_from_screen(row) {
+                            let content_col = state.horizontal_offset + mouse.column as usize;
+                            if state.try_activate_gap(content_row, content_col, MouseButton::Right)
+                            {
+                                needs_redraw = true;
+                            }
                         }
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
@@ -352,6 +366,17 @@ where
                     MouseEventKind::Up(MouseButton::Left) => {
                         let row = mouse.row as usize;
                         if let Some(content_row) = state.content_row_from_screen(row) {
+                            let content_col = state.horizontal_offset + mouse.column as usize;
+                            if state.selection.is_none()
+                                && state.try_activate_gap(
+                                    content_row,
+                                    content_col,
+                                    MouseButton::Left,
+                                )
+                            {
+                                needs_redraw = true;
+                                continue;
+                            }
                             let max_row = state.viewport_height().saturating_sub(1);
                             let line = state.offset + content_row.min(max_row);
                             if let Some(ref mut sel) = state.selection {
@@ -716,6 +741,111 @@ fn plain_offset_to_column(text: &str, offset: usize) -> usize {
         .take_while(|cell| cell.end <= offset)
         .map(|cell| char_width(cell.ch))
         .sum()
+}
+
+fn plain_char_at_column(text: &str, column: usize) -> Option<char> {
+    let mut used = 0usize;
+
+    for cell in parse_plain_cells(text) {
+        let width = char_width(cell.ch);
+        if column < used + width {
+            return Some(cell.ch);
+        }
+        used += width;
+    }
+
+    None
+}
+
+fn plain_char_column(text: &str, target: char) -> Option<usize> {
+    let mut used = 0usize;
+
+    for cell in parse_plain_cells(text) {
+        if cell.ch == target {
+            return Some(used);
+        }
+        used += char_width(cell.ch);
+    }
+
+    None
+}
+
+fn gap_expand_request_for_click(
+    line: &str,
+    column: usize,
+    state: Option<&GapState>,
+) -> Option<GapExpandRequest> {
+    let selector_open = matches!(state, Some(GapState::CollapsedSelector))
+        || matches!(
+            state,
+            Some(GapState::Expanded(expanded))
+                if expanded.hidden_len() > 0 && expanded.selector_open
+        );
+
+    if !selector_open {
+        return Some(GapExpandRequest::Full);
+    }
+
+    let up = plain_char_column(line, '▴')?;
+    let center = plain_char_column(line, '⋮')?;
+    let down = plain_char_column(line, '▾')?;
+    let upper_boundary = (up + center) / 2;
+    let lower_boundary = (center + down).div_ceil(2);
+
+    if column <= upper_boundary {
+        Some(GapExpandRequest::Above)
+    } else if column >= lower_boundary {
+        Some(GapExpandRequest::Below)
+    } else {
+        Some(GapExpandRequest::Full)
+    }
+}
+
+fn expanded_gap_state(lines: Vec<String>, request: GapExpandRequest) -> ExpandedGapState {
+    let len = lines.len();
+    match request {
+        GapExpandRequest::Full => ExpandedGapState::fully_expanded(lines),
+        GapExpandRequest::Above => ExpandedGapState {
+            lines,
+            top_len: GAP_PARTIAL_EXPANSION_LINES.min(len),
+            bottom_len: 0,
+            selector_open: len > GAP_PARTIAL_EXPANSION_LINES,
+        },
+        GapExpandRequest::Below => ExpandedGapState {
+            lines,
+            top_len: 0,
+            bottom_len: GAP_PARTIAL_EXPANSION_LINES.min(len),
+            selector_open: len > GAP_PARTIAL_EXPANSION_LINES,
+        },
+    }
+}
+
+fn apply_expand_request(state: &mut ExpandedGapState, request: GapExpandRequest) -> bool {
+    match request {
+        GapExpandRequest::Full => {
+            let changed = state.hidden_len() > 0;
+            state.top_len = state.lines.len();
+            state.bottom_len = 0;
+            state.selector_open = false;
+            changed
+        }
+        GapExpandRequest::Above => {
+            let max_top = state.lines.len().saturating_sub(state.bottom_len);
+            let new_top = (state.top_len + GAP_PARTIAL_EXPANSION_LINES).min(max_top);
+            let changed = new_top != state.top_len;
+            state.top_len = new_top;
+            state.selector_open = state.hidden_len() > 0;
+            changed
+        }
+        GapExpandRequest::Below => {
+            let max_bottom = state.lines.len().saturating_sub(state.top_len);
+            let new_bottom = (state.bottom_len + GAP_PARTIAL_EXPANSION_LINES).min(max_bottom);
+            let changed = new_bottom != state.bottom_len;
+            state.bottom_len = new_bottom;
+            state.selector_open = state.hidden_len() > 0;
+            changed
+        }
+    }
 }
 
 fn cell_is_highlighted(cell: &StyledCell, matches: &[SearchMatch]) -> bool {
@@ -1170,34 +1300,80 @@ where
     fn has_loading_gaps(&self) -> bool {
         self.gap_states
             .values()
-            .any(|state| matches!(state, GapState::Loading))
+            .any(|state| matches!(state, GapState::Loading(_)))
     }
 
-    fn try_activate_gap(&mut self, row: usize) -> bool {
+    fn try_activate_gap(&mut self, row: usize, column: usize, button: MouseButton) -> bool {
         let line_index = self.offset + row;
         let Some(gap) = self.line_gaps.get(line_index).and_then(|gap| gap.clone()) else {
             return false;
         };
+        let Some(line) = self.plain_lines.get(line_index) else {
+            return false;
+        };
+        let state = self.gap_states.get(&gap.id);
 
-        if matches!(self.gap_states.get(&gap.id), Some(GapState::Expanded(_))) {
-            return true;
-        }
-
-        if !matches!(self.gap_states.get(&gap.id), Some(GapState::Loading)) {
-            self.start_gap_fetch(gap);
+        match button {
+            MouseButton::Left => {
+                let Some(request) = gap_expand_request_for_click(line, column, state) else {
+                    return false;
+                };
+                self.expand_gap(gap, request);
+            }
+            MouseButton::Right => {
+                if matches!(state, Some(GapState::Loading(_))) {
+                    return false;
+                }
+                self.toggle_gap_selector(gap);
+            }
+            _ => return false,
         }
         true
     }
 
-    fn start_gap_fetch(&mut self, gap: GapDescriptor) {
-        self.gap_states.insert(gap.id.clone(), GapState::Loading);
+    fn toggle_gap_selector(&mut self, gap: GapDescriptor) {
+        match self.gap_states.get_mut(&gap.id) {
+            Some(GapState::CollapsedSelector) => {
+                self.gap_states.remove(&gap.id);
+            }
+            Some(GapState::Expanded(state)) if state.hidden_len() > 0 => {
+                state.selector_open = !state.selector_open;
+            }
+            Some(GapState::Expanded(_)) | Some(GapState::Loading(_)) => return,
+            None => {
+                self.gap_states
+                    .insert(gap.id.clone(), GapState::CollapsedSelector);
+            }
+        }
+        self.rerender_preserving_scroll(Some(&gap.id));
+    }
+
+    fn expand_gap(&mut self, gap: GapDescriptor, request: GapExpandRequest) {
+        match self.gap_states.get_mut(&gap.id) {
+            Some(GapState::Expanded(state)) => {
+                if apply_expand_request(state, request) {
+                    self.rerender_preserving_scroll(Some(&gap.id));
+                }
+            }
+            Some(GapState::Loading(_)) => {}
+            Some(GapState::CollapsedSelector) | None => self.start_gap_fetch(gap, request),
+        }
+    }
+
+    fn start_gap_fetch(&mut self, gap: GapDescriptor, request: GapExpandRequest) {
+        self.gap_states
+            .insert(gap.id.clone(), GapState::Loading(request));
         self.rerender_preserving_scroll(Some(&gap.id));
 
         let sender = self.gap_result_tx.clone();
         let fetch_gap = Arc::clone(&self.fetch_gap);
         thread::spawn(move || {
             let result = fetch_gap(&gap).map_err(|err| format!("{err:#}"));
-            let _ = sender.send(GapFetchResult { gap, lines: result });
+            let _ = sender.send(GapFetchResult {
+                gap,
+                request,
+                lines: result,
+            });
         });
     }
 
@@ -1207,8 +1383,10 @@ where
             let gap_id = result.gap.id.clone();
             match result.lines {
                 Ok(lines) => {
-                    self.gap_states
-                        .insert(gap_id.clone(), GapState::Expanded(lines));
+                    self.gap_states.insert(
+                        gap_id.clone(),
+                        GapState::Expanded(expanded_gap_state(lines, result.request)),
+                    );
                 }
                 Err(_) => {
                     self.gap_states.remove(&gap_id);
@@ -1943,19 +2121,25 @@ fn render_centered_overlay_lines(
 mod tests {
     use super::PagerState;
     use super::SearchMode;
+    use super::apply_expand_request;
     use super::build_file_header_lines;
     use super::clip_ansi_text;
     use super::clip_ansi_text_from;
     use super::encode_base64;
+    use super::expanded_gap_state;
     use super::extract_column_range;
     use super::filter_file_names;
     use super::find_matches;
+    use super::gap_expand_request_for_click;
+    use super::plain_char_at_column;
     use super::render_centered_overlay_lines;
     use super::render_highlighted_line;
     use super::render_search_hud;
     use super::should_page_output;
     use super::strip_ansi_text;
+    use crate::render::ExpandedGapState;
     use crate::render::GapDescriptor;
+    use crate::render::GapExpandRequest;
     use crate::render::GapId;
     use crate::render::GapState;
     use crate::render::PaneLayout;
@@ -2040,6 +2224,123 @@ mod tests {
     #[test]
     fn strip_ansi_text_removes_escape_sequences() {
         assert_eq!(strip_ansi_text("\u{1b}[1mheader\u{1b}[0m"), "header");
+    }
+
+    #[test]
+    fn plain_char_at_column_tracks_marker_cells() {
+        assert_eq!(plain_char_at_column("  ▴⋮▾  ", 2), Some('▴'));
+        assert_eq!(plain_char_at_column("  ▴⋮▾  ", 3), Some('⋮'));
+        assert_eq!(plain_char_at_column("  ▴⋮▾  ", 4), Some('▾'));
+    }
+
+    #[test]
+    fn selector_clicks_snap_to_nearest_control() {
+        assert_eq!(
+            gap_expand_request_for_click("  ▴⋮▾ ", 1, Some(&GapState::CollapsedSelector)),
+            Some(GapExpandRequest::Above)
+        );
+        assert_eq!(
+            gap_expand_request_for_click("  ▴⋮▾ ", 3, Some(&GapState::CollapsedSelector)),
+            Some(GapExpandRequest::Full)
+        );
+        assert_eq!(
+            gap_expand_request_for_click("  ▴⋮▾ ", 5, Some(&GapState::CollapsedSelector)),
+            Some(GapExpandRequest::Below)
+        );
+    }
+
+    #[test]
+    fn partial_gap_expansion_reveals_fifteen_lines_per_side() {
+        let lines = (1..=40)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>();
+        let mut state = expanded_gap_state(lines.clone(), GapExpandRequest::Above);
+        assert_eq!(state.top_len, 15);
+        assert_eq!(state.bottom_len, 0);
+        assert!(state.selector_open);
+
+        assert!(apply_expand_request(&mut state, GapExpandRequest::Below));
+        assert_eq!(state.top_len, 15);
+        assert_eq!(state.bottom_len, 15);
+        assert!(state.selector_open);
+
+        assert!(apply_expand_request(&mut state, GapExpandRequest::Below));
+        assert_eq!(state.hidden_len(), 0);
+        assert!(!state.selector_open);
+        assert_eq!(state.lines, lines);
+    }
+
+    #[test]
+    fn clicking_gap_row_starts_and_applies_full_expansion() {
+        let gap = GapDescriptor {
+            id: GapId {
+                file_path: "demo.txt".into(),
+                hunk_index: 0,
+            },
+            start_line: 1,
+            line_count: 2,
+        };
+        let initial_render = RenderedDocument {
+            lines: vec!["⋮".into(), "alpha".into()],
+            line_metadata: vec![
+                crate::render::RenderedLineMetadata {
+                    gap: Some(gap.clone()),
+                },
+                Default::default(),
+            ],
+            layout: PaneLayout::default(),
+        };
+        let mut state = PagerState::new(
+            |_, _, _, gap_states, _| match gap_states.get(&gap.id) {
+                Some(GapState::Expanded(_)) => RenderedDocument {
+                    lines: vec!["one".into(), "two".into(), "alpha".into()],
+                    line_metadata: vec![Default::default(); 3],
+                    layout: PaneLayout::default(),
+                },
+                Some(GapState::Loading(_)) => RenderedDocument {
+                    lines: vec!["loading".into(), "alpha".into()],
+                    line_metadata: vec![
+                        crate::render::RenderedLineMetadata {
+                            gap: Some(gap.clone()),
+                        },
+                        Default::default(),
+                    ],
+                    layout: PaneLayout::default(),
+                },
+                _ => RenderedDocument {
+                    lines: vec!["⋮".into(), "alpha".into()],
+                    line_metadata: vec![
+                        crate::render::RenderedLineMetadata {
+                            gap: Some(gap.clone()),
+                        },
+                        Default::default(),
+                    ],
+                    layout: PaneLayout::default(),
+                },
+            },
+            move |_| Ok(vec!["one".into(), "two".into()]),
+            Box::new(Vec::new),
+            None,
+            80,
+            5,
+            initial_render,
+            Vec::new(),
+            TintPalette::default(),
+        );
+
+        assert!(state.try_activate_gap(0, 0, crossterm::event::MouseButton::Left));
+        assert!(matches!(
+            state.gap_states.get(&gap.id),
+            Some(GapState::Loading(GapExpandRequest::Full))
+        ));
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(state.drain_gap_fetch_results());
+        assert!(matches!(
+            state.gap_states.get(&gap.id),
+            Some(GapState::Expanded(_))
+        ));
+        assert_eq!(state.line_at(0), Some("one"));
     }
 
     #[test]
@@ -2456,7 +2757,11 @@ mod tests {
 
         state.gap_states.insert(
             gap.id.clone(),
-            GapState::Expanded(vec!["one".into(), "two".into(), "three".into()]),
+            GapState::Expanded(ExpandedGapState::fully_expanded(vec![
+                "one".into(),
+                "two".into(),
+                "three".into(),
+            ])),
         );
         state.rerender_preserving_scroll(Some(&gap.id));
 

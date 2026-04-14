@@ -103,8 +103,42 @@ pub struct GapDescriptor {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GapState {
-    Loading,
-    Expanded(Vec<String>),
+    CollapsedSelector,
+    Loading(GapExpandRequest),
+    Expanded(ExpandedGapState),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GapExpandRequest {
+    Full,
+    Above,
+    Below,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpandedGapState {
+    pub lines: Vec<String>,
+    pub top_len: usize,
+    pub bottom_len: usize,
+    pub selector_open: bool,
+}
+
+impl ExpandedGapState {
+    pub fn fully_expanded(lines: Vec<String>) -> Self {
+        let len = lines.len();
+        Self {
+            lines,
+            top_len: len,
+            bottom_len: 0,
+            selector_open: false,
+        }
+    }
+
+    pub fn hidden_len(&self) -> usize {
+        self.lines
+            .len()
+            .saturating_sub(self.top_len.saturating_add(self.bottom_len))
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -323,19 +357,17 @@ fn render_inline_file_section(
                         line_count: elided,
                     };
                     match gap_states.get(&gap.id) {
-                        Some(GapState::Expanded(lines)) => {
-                            render_inline_expanded_gap_lines(
-                                lines,
-                                start_line,
-                                line_number_width,
-                                output,
-                            );
+                        Some(GapState::Expanded(state)) => {
+                            render_inline_gap_state(&gap, line_number_width, output, state);
                         }
-                        Some(GapState::Loading) => {
+                        Some(GapState::Loading(_)) => {
                             output.push_line(
                                 render_inline_spinner(line_number_width, spinner_frame),
                                 Some(gap),
                             );
+                        }
+                        Some(GapState::CollapsedSelector) => {
+                            output.push_line(render_inline_selector(line_number_width), Some(gap));
                         }
                         None => {
                             output.push_line(
@@ -464,14 +496,17 @@ fn render_file_section(
                         line_count: elided,
                     };
                     match gap_states.get(&gap.id) {
-                        Some(GapState::Expanded(lines)) => {
-                            render_expanded_gap_lines(lines, start_line, layout, palette, output);
+                        Some(GapState::Expanded(state)) => {
+                            render_gap_state(&gap, layout, palette, output, state);
                         }
-                        Some(GapState::Loading) => {
+                        Some(GapState::Loading(_)) => {
                             output.push_line(
                                 render_compact_spinner_row(layout, spinner_frame),
                                 Some(gap),
                             );
+                        }
+                        Some(GapState::CollapsedSelector) => {
+                            output.push_line(render_compact_selector_row(layout), Some(gap));
                         }
                         None => {
                             output.push_line(render_compact_elision_row(layout), Some(gap));
@@ -671,14 +706,19 @@ fn spinner_glyph(frame: usize) -> char {
 }
 
 fn render_compact_elision_row(layout: Layout) -> String {
-    render_compact_marker_row(layout, '⋮')
+    render_compact_marker_row(layout, "⋮")
+}
+
+fn render_compact_selector_row(layout: Layout) -> String {
+    render_compact_marker_row(layout, "▴⋮▾")
 }
 
 fn render_compact_spinner_row(layout: Layout, frame: usize) -> String {
-    render_compact_marker_row(layout, spinner_glyph(frame))
+    let marker = spinner_glyph(frame).to_string();
+    render_compact_marker_row(layout, &marker)
 }
 
-fn render_compact_marker_row(layout: Layout, marker: char) -> String {
+fn render_compact_marker_row(layout: Layout, marker: &str) -> String {
     let mut output = String::new();
     output.push_str(&render_plain_cell("", layout.left_text_width));
     output.push_str(PANE_GAP);
@@ -689,14 +729,19 @@ fn render_compact_marker_row(layout: Layout, marker: char) -> String {
 }
 
 fn render_inline_ellipsis(line_number_width: usize, _elided: usize) -> String {
-    render_inline_marker(line_number_width, '⋮')
+    render_inline_marker(line_number_width, "⋮")
+}
+
+fn render_inline_selector(line_number_width: usize) -> String {
+    render_inline_marker(line_number_width, "▴⋮▾")
 }
 
 fn render_inline_spinner(line_number_width: usize, frame: usize) -> String {
-    render_inline_marker(line_number_width, spinner_glyph(frame))
+    let marker = spinner_glyph(frame).to_string();
+    render_inline_marker(line_number_width, &marker)
 }
 
-fn render_inline_marker(line_number_width: usize, marker: char) -> String {
+fn render_inline_marker(line_number_width: usize, marker: &str) -> String {
     format!("{marker:>line_number_width$}")
 }
 
@@ -710,6 +755,39 @@ fn render_inline_expanded_gap_lines(
         output.push_line(
             render_inline_context_line(start_line + offset, line, line_number_width),
             None,
+        );
+    }
+}
+
+fn render_inline_gap_state(
+    gap: &GapDescriptor,
+    line_number_width: usize,
+    output: &mut RenderedDocument,
+    state: &ExpandedGapState,
+) {
+    render_inline_expanded_gap_lines(
+        &state.lines[..state.top_len],
+        gap.start_line,
+        line_number_width,
+        output,
+    );
+
+    if state.hidden_len() > 0 {
+        let marker = if state.selector_open {
+            render_inline_selector(line_number_width)
+        } else {
+            render_inline_ellipsis(line_number_width, state.hidden_len())
+        };
+        output.push_line(marker, Some(gap.clone()));
+    }
+
+    if state.bottom_len > 0 {
+        let start_line = gap.start_line + state.lines.len().saturating_sub(state.bottom_len);
+        render_inline_expanded_gap_lines(
+            &state.lines[state.lines.len() - state.bottom_len..],
+            start_line,
+            line_number_width,
+            output,
         );
     }
 }
@@ -764,13 +842,15 @@ fn render_inline_changed_line(
     render_inline_inserted_line(line_number, new, line_number_width, palette)
 }
 
-fn render_marker_cell(width: usize, marker: char) -> String {
-    let left_pad = width.saturating_sub(1) / 2;
-    let right_pad = width.saturating_sub(1 + left_pad);
+fn render_marker_cell(width: usize, marker: &str) -> String {
+    let marker_width = display_width(marker).min(width);
+    let clipped = clip_plain_text(marker, width);
+    let left_pad = width.saturating_sub(marker_width) / 2;
+    let right_pad = width.saturating_sub(marker_width + left_pad);
     format!(
         "{}{}{}",
         " ".repeat(left_pad),
-        marker,
+        clipped,
         " ".repeat(right_pad)
     )
 }
@@ -877,6 +957,42 @@ fn render_expanded_gap_lines(
             palette,
             rendered,
             &mut show_gap_continuation,
+        );
+    }
+}
+
+fn render_gap_state(
+    gap: &GapDescriptor,
+    layout: Layout,
+    palette: &TintPalette,
+    output: &mut RenderedDocument,
+    state: &ExpandedGapState,
+) {
+    render_expanded_gap_lines(
+        &state.lines[..state.top_len],
+        gap.start_line,
+        layout,
+        palette,
+        output,
+    );
+
+    if state.hidden_len() > 0 {
+        let marker = if state.selector_open {
+            render_compact_selector_row(layout)
+        } else {
+            render_compact_elision_row(layout)
+        };
+        output.push_line(marker, Some(gap.clone()));
+    }
+
+    if state.bottom_len > 0 {
+        let start_line = gap.start_line + state.lines.len().saturating_sub(state.bottom_len);
+        render_expanded_gap_lines(
+            &state.lines[state.lines.len() - state.bottom_len..],
+            start_line,
+            layout,
+            palette,
+            output,
         );
     }
 }
@@ -1072,6 +1188,8 @@ fn char_width(ch: char) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::ExpandedGapState;
+    use super::GapExpandRequest;
     use super::GapId;
     use super::GapState;
     use super::Layout;
@@ -1227,7 +1345,7 @@ mod tests {
                 file_path: "demo.txt".into(),
                 hunk_index: 0,
             },
-            GapState::Loading,
+            GapState::Loading(GapExpandRequest::Full),
         );
 
         let rendered =
@@ -1260,7 +1378,10 @@ mod tests {
                 file_path: "demo.txt".into(),
                 hunk_index: 0,
             },
-            GapState::Expanded(vec!["alpha".into(), "beta".into()]),
+            GapState::Expanded(ExpandedGapState::fully_expanded(vec![
+                "alpha".into(),
+                "beta".into(),
+            ])),
         );
 
         let rendered =
@@ -1365,5 +1486,70 @@ mod tests {
             right_render_width: 6,
         });
         assert!(header.contains(" ⋮  "));
+    }
+
+    #[test]
+    fn renders_selector_for_collapsed_gap() {
+        let document = Document::from_items(vec![
+            Item::FileHeader("demo.txt".into()),
+            Item::Hunk(Hunk {
+                old_start: 3,
+                new_start: 3,
+                new_len: 1,
+                rows: vec![Row::Context("gamma".into())],
+            }),
+        ]);
+        let mut gap_states = HashMap::new();
+        gap_states.insert(
+            GapId {
+                file_path: "demo.txt".into(),
+                hunk_index: 0,
+            },
+            GapState::CollapsedSelector,
+        );
+
+        let rendered =
+            render_document_with_state(&document, 140, &TintPalette::default(), &gap_states, 0);
+
+        assert!(rendered.lines[1].contains("▴⋮▾"));
+    }
+
+    #[test]
+    fn renders_partial_gap_with_selector_between_revealed_slices() {
+        let document = Document::from_items(vec![
+            Item::FileHeader("demo.txt".into()),
+            Item::Hunk(Hunk {
+                old_start: 5,
+                new_start: 5,
+                new_len: 1,
+                rows: vec![Row::Context("epsilon".into())],
+            }),
+        ]);
+        let mut gap_states = HashMap::new();
+        gap_states.insert(
+            GapId {
+                file_path: "demo.txt".into(),
+                hunk_index: 0,
+            },
+            GapState::Expanded(ExpandedGapState {
+                lines: vec![
+                    "alpha".into(),
+                    "beta".into(),
+                    "gamma".into(),
+                    "delta".into(),
+                ],
+                top_len: 1,
+                bottom_len: 1,
+                selector_open: true,
+            }),
+        );
+
+        let rendered =
+            render_document_with_state(&document, 140, &TintPalette::default(), &gap_states, 0);
+
+        assert!(rendered.lines[1].contains("alpha"));
+        assert!(rendered.lines[2].contains("▴⋮▾"));
+        assert!(rendered.lines[3].contains("delta"));
+        assert!(rendered.line_metadata[2].gap.is_some());
     }
 }
