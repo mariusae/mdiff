@@ -1483,10 +1483,9 @@ where
             return;
         }
 
-        let preferred = self.current_top_file_name();
         self.palette = palette;
         self.search_bg = search_bg;
-        self.rerender(preferred);
+        self.rerender_preserving_scroll(None);
     }
 
     fn scroll_left(&mut self) {
@@ -2905,6 +2904,31 @@ mod tests {
         );
 
         assert_eq!(state.line_at(0), Some("Some(Indexed(240))"));
+    }
+
+    #[test]
+    fn applying_new_palette_preserves_scroll_position() {
+        let rendered = "\u{1b}[1mfile1\u{1b}[0m\none\ntwo\n\u{1b}[1mfile2\u{1b}[0m\nthree".to_owned();
+        let initial = rendered.clone();
+        let mut state = new_state(
+            |_, _, _, _, _| test_render(rendered.clone()),
+            80,
+            3,
+            initial,
+            vec!["file1".into(), "file2".into()],
+        );
+        state.offset = 2;
+
+        state.apply_palette(
+            TintPalette {
+                changed_line_bg: Some(AnsiColor::Indexed(240)),
+                gutter_fg: Some(AnsiColor::Indexed(238)),
+            },
+            None,
+        );
+
+        assert_eq!(state.offset, 2);
+        assert_eq!(state.line_at(0), Some("two"));
     }
 
     #[test]
