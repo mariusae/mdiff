@@ -141,9 +141,17 @@ impl ExpandedGapState {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceLocation {
+    pub file_path: String,
+    pub left_line_number: Option<usize>,
+    pub right_line_number: Option<usize>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RenderedLineMetadata {
     pub gap: Option<GapDescriptor>,
+    pub source: Option<SourceLocation>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -162,9 +170,15 @@ impl RenderedDocument {
         }
     }
 
-    fn push_line(&mut self, text: String, gap: Option<GapDescriptor>) {
+    fn push_line(
+        &mut self,
+        text: String,
+        gap: Option<GapDescriptor>,
+        source: Option<SourceLocation>,
+    ) {
         self.lines.push(text);
-        self.line_metadata.push(RenderedLineMetadata { gap });
+        self.line_metadata
+            .push(RenderedLineMetadata { gap, source });
     }
 
     pub fn into_output(self) -> String {
@@ -193,7 +207,9 @@ enum RenderedRow {
         left_text: String,
         left_background: Option<AnsiColor>,
         left_dim: bool,
+        left_line_number: Option<usize>,
         center_number: String,
+        right_line_number: Option<usize>,
         right_gutter: bool,
         right_line: StyledLine,
     },
@@ -219,9 +235,9 @@ pub fn render_document_with_state(
         match item {
             Item::FileHeader(path) => {
                 if !output.lines.is_empty() {
-                    output.push_line(String::new(), None);
+                    output.push_line(String::new(), None, None);
                 }
-                output.push_line(render_file_header(path), None);
+                output.push_line(render_file_header(path), None, None);
 
                 let section_end = next_file_header_index(&document.items, index + 1);
                 render_file_section(
@@ -237,7 +253,7 @@ pub fn render_document_with_state(
                 index = section_end;
             }
             Item::Meta(line) => {
-                output.push_line(clip_plain_text(line, width), None);
+                output.push_line(clip_plain_text(line, width), None, None);
                 index += 1;
             }
             Item::Hunk(_) => {
@@ -282,9 +298,9 @@ pub fn render_inline_document_with_state(
         match item {
             Item::FileHeader(path) => {
                 if !output.lines.is_empty() {
-                    output.push_line(String::new(), None);
+                    output.push_line(String::new(), None, None);
                 }
-                output.push_line(render_file_header(path), None);
+                output.push_line(render_file_header(path), None, None);
 
                 let section_end = next_file_header_index(&document.items, index + 1);
                 render_inline_file_section(
@@ -364,15 +380,21 @@ fn render_inline_file_section(
                             output.push_line(
                                 render_inline_spinner(line_number_width, spinner_frame),
                                 Some(gap),
+                                None,
                             );
                         }
                         Some(GapState::CollapsedSelector) => {
-                            output.push_line(render_inline_selector(line_number_width), Some(gap));
+                            output.push_line(
+                                render_inline_selector(line_number_width),
+                                Some(gap),
+                                None,
+                            );
                         }
                         None => {
                             output.push_line(
                                 render_inline_ellipsis(line_number_width, elided),
                                 Some(gap),
+                                None,
                             );
                         }
                     }
@@ -390,6 +412,7 @@ fn render_inline_file_section(
                             output.push_line(
                                 render_inline_context_line(line_number, text, line_number_width),
                                 None,
+                                source_location(file_path, Some(line_number), Some(line_number)),
                             );
                         }
                         Row::Delete(text) => {
@@ -403,6 +426,7 @@ fn render_inline_file_section(
                                     palette,
                                 ),
                                 None,
+                                source_location(file_path, Some(line_number), None),
                             );
                         }
                         Row::Insert(text) => {
@@ -416,6 +440,7 @@ fn render_inline_file_section(
                                     palette,
                                 ),
                                 None,
+                                source_location(file_path, None, Some(line_number)),
                             );
                         }
                         Row::Change { old, new } => {
@@ -432,6 +457,7 @@ fn render_inline_file_section(
                                     palette,
                                 ),
                                 None,
+                                source_location(file_path, Some(old_number), None),
                             );
                             output.push_line(
                                 render_inline_changed_line(
@@ -441,10 +467,11 @@ fn render_inline_file_section(
                                     palette,
                                 ),
                                 None,
+                                source_location(file_path, None, Some(new_number)),
                             );
                         }
                         Row::Annotation(text) => {
-                            output.push_line(text.clone(), None);
+                            output.push_line(text.clone(), None, None);
                         }
                     }
                 }
@@ -476,7 +503,7 @@ fn render_file_section(
     for (item_index, item) in items.iter().enumerate() {
         match item {
             Item::Meta(line) => {
-                output.push_line(clip_plain_text(line, width), None);
+                output.push_line(clip_plain_text(line, width), None, None);
             }
             Item::Hunk(hunk) => {
                 let hunk_index = hunk_positions
@@ -503,13 +530,14 @@ fn render_file_section(
                             output.push_line(
                                 render_compact_spinner_row(layout, spinner_frame),
                                 Some(gap),
+                                None,
                             );
                         }
                         Some(GapState::CollapsedSelector) => {
-                            output.push_line(render_compact_selector_row(layout), Some(gap));
+                            output.push_line(render_compact_selector_row(layout), Some(gap), None);
                         }
                         None => {
-                            output.push_line(render_compact_elision_row(layout), Some(gap));
+                            output.push_line(render_compact_elision_row(layout), Some(gap), None);
                         }
                     }
                     show_gap_continuation = true;
@@ -525,6 +553,7 @@ fn render_file_section(
                         width,
                         layout,
                         palette,
+                        file_path,
                         rendered,
                         &mut show_gap_continuation,
                     );
@@ -700,6 +729,22 @@ fn render_file_header(path: &str) -> String {
     format!("\u{1b}[1m{path}\u{1b}[0m")
 }
 
+fn source_location(
+    file_path: &str,
+    left_line_number: Option<usize>,
+    right_line_number: Option<usize>,
+) -> Option<SourceLocation> {
+    if file_path.is_empty() || (left_line_number.is_none() && right_line_number.is_none()) {
+        return None;
+    }
+
+    Some(SourceLocation {
+        file_path: file_path.to_owned(),
+        left_line_number,
+        right_line_number,
+    })
+}
+
 fn spinner_glyph(frame: usize) -> char {
     const FRAMES: &[char] = &['⠁', '⠂', '⠄', '⠂'];
     FRAMES[frame % FRAMES.len()]
@@ -746,6 +791,7 @@ fn render_inline_marker(line_number_width: usize, marker: &str) -> String {
 }
 
 fn render_inline_expanded_gap_lines(
+    file_path: &str,
     lines: &[String],
     start_line: usize,
     line_number_width: usize,
@@ -755,6 +801,11 @@ fn render_inline_expanded_gap_lines(
         output.push_line(
             render_inline_context_line(start_line + offset, line, line_number_width),
             None,
+            source_location(
+                file_path,
+                Some(start_line + offset),
+                Some(start_line + offset),
+            ),
         );
     }
 }
@@ -766,6 +817,7 @@ fn render_inline_gap_state(
     state: &ExpandedGapState,
 ) {
     render_inline_expanded_gap_lines(
+        &gap.id.file_path,
         &state.lines[..state.top_len],
         gap.start_line,
         line_number_width,
@@ -778,12 +830,13 @@ fn render_inline_gap_state(
         } else {
             render_inline_ellipsis(line_number_width, state.hidden_len())
         };
-        output.push_line(marker, Some(gap.clone()));
+        output.push_line(marker, Some(gap.clone()), None);
     }
 
     if state.bottom_len > 0 {
         let start_line = gap.start_line + state.lines.len().saturating_sub(state.bottom_len);
         render_inline_expanded_gap_lines(
+            &gap.id.file_path,
             &state.lines[state.lines.len() - state.bottom_len..],
             start_line,
             line_number_width,
@@ -872,7 +925,9 @@ fn render_row(
                 left_text: line.clone(),
                 left_background: None,
                 left_dim: false,
+                left_line_number: Some(right_number),
                 center_number: format_right_line_number(Some(right_number)),
+                right_line_number: Some(right_number),
                 right_gutter: false,
                 right_line: StyledLine {
                     text: line,
@@ -881,13 +936,16 @@ fn render_row(
             }
         }
         Row::Delete(text) => {
+            let left_number = *old_line;
             *old_line += 1;
 
             RenderedRow::SideBySide {
                 left_text: expand_tabs(text),
                 left_background: palette.changed_line_bg,
                 left_dim: true,
+                left_line_number: Some(left_number),
                 center_number: format_right_line_number(None),
+                right_line_number: None,
                 right_gutter: false,
                 right_line: StyledLine::default(),
             }
@@ -900,7 +958,9 @@ fn render_row(
                 left_text: String::new(),
                 left_background: None,
                 left_dim: false,
+                left_line_number: None,
                 center_number: format_right_line_number(Some(right_number)),
+                right_line_number: Some(right_number),
                 right_gutter: true,
                 right_line: StyledLine {
                     text: expand_tabs(text),
@@ -909,6 +969,7 @@ fn render_row(
             }
         }
         Row::Change { old, new } => {
+            let left_number = *old_line;
             let right_number = *new_line;
             *old_line += 1;
             *new_line += 1;
@@ -917,7 +978,9 @@ fn render_row(
                 left_text: expand_tabs(old),
                 left_background: palette.changed_line_bg,
                 left_dim: true,
+                left_line_number: Some(left_number),
                 center_number: format_right_line_number(Some(right_number)),
+                right_line_number: Some(right_number),
                 right_gutter: true,
                 right_line: StyledLine {
                     text: expand_tabs(new),
@@ -930,6 +993,7 @@ fn render_row(
 }
 
 fn render_expanded_gap_lines(
+    file_path: &str,
     lines: &[String],
     start_line: usize,
     layout: Layout,
@@ -942,7 +1006,9 @@ fn render_expanded_gap_lines(
             left_text: expanded.clone(),
             left_background: None,
             left_dim: false,
+            left_line_number: Some(start_line + offset),
             center_number: format_right_line_number(Some(start_line + offset)),
+            right_line_number: Some(start_line + offset),
             right_gutter: false,
             right_line: StyledLine {
                 text: expanded,
@@ -955,6 +1021,7 @@ fn render_expanded_gap_lines(
             layout.left_text_width + layout.center_number_width + layout.right_visible_width,
             layout,
             palette,
+            file_path,
             rendered,
             &mut show_gap_continuation,
         );
@@ -969,6 +1036,7 @@ fn render_gap_state(
     state: &ExpandedGapState,
 ) {
     render_expanded_gap_lines(
+        &gap.id.file_path,
         &state.lines[..state.top_len],
         gap.start_line,
         layout,
@@ -982,12 +1050,13 @@ fn render_gap_state(
         } else {
             render_compact_elision_row(layout)
         };
-        output.push_line(marker, Some(gap.clone()));
+        output.push_line(marker, Some(gap.clone()), None);
     }
 
     if state.bottom_len > 0 {
         let start_line = gap.start_line + state.lines.len().saturating_sub(state.bottom_len);
         render_expanded_gap_lines(
+            &gap.id.file_path,
             &state.lines[state.lines.len() - state.bottom_len..],
             start_line,
             layout,
@@ -1002,6 +1071,7 @@ fn push_rendered_row(
     width: usize,
     layout: Layout,
     palette: &TintPalette,
+    file_path: &str,
     row: RenderedRow,
     show_gap_continuation: &mut bool,
 ) {
@@ -1010,7 +1080,9 @@ fn push_rendered_row(
             mut left_text,
             left_background,
             left_dim,
+            left_line_number,
             center_number,
+            right_line_number,
             right_gutter,
             right_line,
         } => {
@@ -1049,10 +1121,14 @@ fn push_rendered_row(
             } else {
                 line.push_str(&right_cell);
             }
-            output.push_line(line, None);
+            output.push_line(
+                line,
+                None,
+                source_location(file_path, left_line_number, right_line_number),
+            );
         }
         RenderedRow::FullWidth(text) => {
-            output.push_line(clip_plain_text(&text, width), None);
+            output.push_line(clip_plain_text(&text, width), None, None);
         }
     }
 }

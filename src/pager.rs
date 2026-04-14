@@ -5,6 +5,7 @@ use crate::render::GapId;
 use crate::render::GapState;
 use crate::render::PaneLayout;
 use crate::render::RenderedDocument;
+use crate::render::SourceLocation;
 use crate::render::TintPalette;
 use crate::terminal_palette::AnsiColor;
 use crate::terminal_palette::search_highlight_bg;
@@ -141,6 +142,7 @@ struct Selection {
     pane: SelectionPane,
     anchor_line: usize,
     extent_line: usize,
+    markdown: bool,
 }
 
 struct GapFetchResult {
@@ -338,6 +340,7 @@ where
                                 pane,
                                 anchor_line: line,
                                 extent_line: line,
+                                markdown: mouse.modifiers.contains(KeyModifiers::ALT),
                             });
                             needs_redraw = true;
                         }
@@ -1024,6 +1027,7 @@ where
     palette: TintPalette,
     gap_states: HashMap<GapId, GapState>,
     line_gaps: Vec<Option<GapDescriptor>>,
+    line_sources: Vec<Option<SourceLocation>>,
     lines: Vec<String>,
     plain_lines: Vec<String>,
     offset: usize,
@@ -1069,8 +1073,13 @@ where
         let lines = initial_render.lines;
         let line_gaps = initial_render
             .line_metadata
+            .iter()
+            .map(|meta| meta.gap.clone())
+            .collect::<Vec<_>>();
+        let line_sources = initial_render
+            .line_metadata
             .into_iter()
-            .map(|meta| meta.gap)
+            .map(|meta| meta.source)
             .collect::<Vec<_>>();
         let plain_lines = rebuild_plain_lines(&lines);
         let visible_files = all_files.clone();
@@ -1083,6 +1092,7 @@ where
             palette,
             gap_states: HashMap::new(),
             line_gaps,
+            line_sources,
             lines,
             plain_lines,
             offset: 0,
@@ -1178,8 +1188,13 @@ where
         self.pane_layout = rendered.layout;
         self.line_gaps = rendered
             .line_metadata
+            .iter()
+            .map(|meta| meta.gap.clone())
+            .collect();
+        self.line_sources = rendered
+            .line_metadata
             .into_iter()
-            .map(|meta| meta.gap)
+            .map(|meta| meta.source)
             .collect();
         self.lines = rendered.lines;
         self.plain_lines = rebuild_plain_lines(&self.lines);
@@ -1995,17 +2010,120 @@ where
         };
 
         let mut lines = Vec::new();
+        let mut start_location = None;
         for i in start..=end {
-            if let Some(line) = self.plain_lines.get(i) {
+            if let Some(gap) = self.line_gaps.get(i).and_then(|gap| gap.as_ref()) {
+                for (text, source) in self.gap_selection_lines(gap, sel.pane) {
+                    if start_location.is_none() {
+                        start_location = source;
+                    }
+                    lines.push(text);
+                }
+            } else if let Some(line) = self.plain_lines.get(i) {
                 let extracted = extract_column_range(line, col_start, col_end);
+                if start_location.is_none() {
+                    start_location = self
+                        .line_sources
+                        .get(i)
+                        .and_then(|source| source.as_ref())
+                        .and_then(|source| selection_start_location(source, sel.pane));
+                }
                 lines.push(extracted.trim_end().to_owned());
             }
         }
         while lines.last().is_some_and(|l| l.is_empty()) {
             lines.pop();
         }
-        lines.join("\n")
+        let text = lines.join("\n");
+        if sel.markdown {
+            format_markdown_copy(start_location.as_ref(), &text)
+        } else {
+            text
+        }
     }
+
+    fn gap_selection_lines(
+        &self,
+        gap: &GapDescriptor,
+        pane: SelectionPane,
+    ) -> Vec<(String, Option<SourceLocation>)> {
+        match self.gap_states.get(&gap.id) {
+            Some(GapState::Expanded(state)) => {
+                let start = state.top_len.min(state.lines.len());
+                let end = state.lines.len().saturating_sub(state.bottom_len);
+                state.lines[start..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, line)| {
+                        let line_number = gap.start_line + start + offset;
+                        (
+                            line.trim_end().to_owned(),
+                            selection_start_location(
+                                &SourceLocation {
+                                    file_path: gap.id.file_path.clone(),
+                                    left_line_number: Some(line_number),
+                                    right_line_number: Some(line_number),
+                                },
+                                pane,
+                            ),
+                        )
+                    })
+                    .collect()
+            }
+            Some(GapState::CollapsedSelector) | Some(GapState::Loading(_)) | None => {
+                (self.fetch_gap)(gap)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(offset, line)| {
+                        let line_number = gap.start_line + offset;
+                        (
+                            line.trim_end().to_owned(),
+                            selection_start_location(
+                                &SourceLocation {
+                                    file_path: gap.id.file_path.clone(),
+                                    left_line_number: Some(line_number),
+                                    right_line_number: Some(line_number),
+                                },
+                                pane,
+                            ),
+                        )
+                    })
+                    .collect()
+            }
+        }
+    }
+}
+
+fn selection_start_location(
+    source: &SourceLocation,
+    pane: SelectionPane,
+) -> Option<SourceLocation> {
+    let line_number = match pane {
+        SelectionPane::Left => source.left_line_number.or(source.right_line_number),
+        SelectionPane::Right | SelectionPane::Full => {
+            source.right_line_number.or(source.left_line_number)
+        }
+    }?;
+
+    Some(SourceLocation {
+        file_path: source.file_path.clone(),
+        left_line_number: Some(line_number),
+        right_line_number: Some(line_number),
+    })
+}
+
+fn format_markdown_copy(location: Option<&SourceLocation>, text: &str) -> String {
+    let header = location
+        .map(|source| {
+            let line = source.right_line_number.or(source.left_line_number);
+            match line {
+                Some(line) => format!("**{}:{}**", source.file_path, line),
+                None => format!("**{}**", source.file_path),
+            }
+        })
+        .unwrap_or_else(|| "**selection**".to_owned());
+    format!("{header}\n\n```\n{text}\n```")
 }
 
 fn extract_column_range(text: &str, start_col: usize, end_col: usize) -> String {
@@ -2121,6 +2239,8 @@ fn render_centered_overlay_lines(
 mod tests {
     use super::PagerState;
     use super::SearchMode;
+    use super::Selection;
+    use super::SelectionPane;
     use super::apply_expand_request;
     use super::build_file_header_lines;
     use super::clip_ansi_text;
@@ -2144,6 +2264,7 @@ mod tests {
     use crate::render::GapState;
     use crate::render::PaneLayout;
     use crate::render::RenderedDocument;
+    use crate::render::SourceLocation;
     use crate::render::TintPalette;
     use crate::terminal_palette::AnsiColor;
     use anyhow::Result;
@@ -2285,6 +2406,7 @@ mod tests {
             line_metadata: vec![
                 crate::render::RenderedLineMetadata {
                     gap: Some(gap.clone()),
+                    source: None,
                 },
                 Default::default(),
             ],
@@ -2302,6 +2424,7 @@ mod tests {
                     line_metadata: vec![
                         crate::render::RenderedLineMetadata {
                             gap: Some(gap.clone()),
+                            source: None,
                         },
                         Default::default(),
                     ],
@@ -2312,6 +2435,7 @@ mod tests {
                     line_metadata: vec![
                         crate::render::RenderedLineMetadata {
                             gap: Some(gap.clone()),
+                            source: None,
                         },
                         Default::default(),
                     ],
@@ -2341,6 +2465,155 @@ mod tests {
             Some(GapState::Expanded(_))
         ));
         assert_eq!(state.line_at(0), Some("one"));
+    }
+
+    #[test]
+    fn copying_collapsed_gap_uses_underlying_lines() {
+        let gap = GapDescriptor {
+            id: GapId {
+                file_path: "demo.txt".into(),
+                hunk_index: 0,
+            },
+            start_line: 10,
+            line_count: 2,
+        };
+        let initial_render = RenderedDocument {
+            lines: vec!["⋮".into()],
+            line_metadata: vec![crate::render::RenderedLineMetadata {
+                gap: Some(gap.clone()),
+                source: None,
+            }],
+            layout: PaneLayout::default(),
+        };
+        let mut state = PagerState::new(
+            |_, _, _, _, _| RenderedDocument {
+                lines: vec!["⋮".into()],
+                line_metadata: vec![crate::render::RenderedLineMetadata {
+                    gap: Some(gap.clone()),
+                    source: None,
+                }],
+                layout: PaneLayout::default(),
+            },
+            move |_| Ok(vec!["alpha".into(), "beta".into()]),
+            Box::new(Vec::new),
+            None,
+            80,
+            5,
+            initial_render,
+            Vec::new(),
+            TintPalette::default(),
+        );
+        state.selection = Some(Selection {
+            pane: SelectionPane::Full,
+            anchor_line: 0,
+            extent_line: 0,
+            markdown: false,
+        });
+
+        assert_eq!(state.extract_selection_text(), "alpha\nbeta");
+    }
+
+    #[test]
+    fn copying_partial_gap_uses_hidden_middle_lines_only() {
+        let gap = GapDescriptor {
+            id: GapId {
+                file_path: "demo.txt".into(),
+                hunk_index: 0,
+            },
+            start_line: 10,
+            line_count: 4,
+        };
+        let initial_render = RenderedDocument {
+            lines: vec!["10  alpha".into(), "▴⋮▾".into(), "13  delta".into()],
+            line_metadata: vec![
+                Default::default(),
+                crate::render::RenderedLineMetadata {
+                    gap: Some(gap.clone()),
+                    source: None,
+                },
+                Default::default(),
+            ],
+            layout: PaneLayout::default(),
+        };
+        let rendered = initial_render.clone();
+        let mut state = PagerState::new(
+            move |_, _, _, _, _| rendered.clone(),
+            move |_| Ok(Vec::new()),
+            Box::new(Vec::new),
+            None,
+            80,
+            5,
+            initial_render,
+            Vec::new(),
+            TintPalette::default(),
+        );
+        state.gap_states.insert(
+            gap.id.clone(),
+            GapState::Expanded(ExpandedGapState {
+                lines: vec![
+                    "alpha".into(),
+                    "beta".into(),
+                    "gamma".into(),
+                    "delta".into(),
+                ],
+                top_len: 1,
+                bottom_len: 1,
+                selector_open: true,
+            }),
+        );
+        state.selection = Some(Selection {
+            pane: SelectionPane::Full,
+            anchor_line: 0,
+            extent_line: 2,
+            markdown: false,
+        });
+
+        assert_eq!(
+            state.extract_selection_text(),
+            "10  alpha\nbeta\ngamma\n13  delta"
+        );
+    }
+
+    #[test]
+    fn alt_selection_copies_markdown_with_location() {
+        let initial_render = RenderedDocument {
+            lines: vec!["fn demo() {}".into()],
+            line_metadata: vec![crate::render::RenderedLineMetadata {
+                gap: None,
+                source: Some(SourceLocation {
+                    file_path: "src/demo.rs".into(),
+                    left_line_number: None,
+                    right_line_number: Some(914),
+                }),
+            }],
+            layout: PaneLayout {
+                left_end: 0,
+                right_start: 0,
+                content_start: 0,
+            },
+        };
+        let mut state = PagerState::new(
+            |_, _, _, _, _| RenderedDocument::default(),
+            noop_fetch as fn(&GapDescriptor) -> Result<Vec<String>>,
+            Box::new(Vec::new),
+            None,
+            80,
+            5,
+            initial_render,
+            Vec::new(),
+            TintPalette::default(),
+        );
+        state.selection = Some(Selection {
+            pane: SelectionPane::Full,
+            anchor_line: 0,
+            extent_line: 0,
+            markdown: true,
+        });
+
+        assert_eq!(
+            state.extract_selection_text(),
+            "**src/demo.rs:914**\n\n```\nfn demo() {}\n```"
+        );
     }
 
     #[test]
@@ -2707,6 +2980,7 @@ mod tests {
             line_metadata: vec![
                 crate::render::RenderedLineMetadata {
                     gap: Some(gap.clone()),
+                    source: None,
                 },
                 Default::default(),
                 Default::default(),
@@ -2735,6 +3009,7 @@ mod tests {
                         line_metadata: vec![
                             crate::render::RenderedLineMetadata {
                                 gap: Some(gap.clone()),
+                                source: None,
                             },
                             Default::default(),
                             Default::default(),
