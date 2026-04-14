@@ -227,6 +227,24 @@ pub fn render_document_with_state(
     gap_states: &HashMap<GapId, GapState>,
     spinner_frame: usize,
 ) -> RenderedDocument {
+    render_document_with_state_and_file_counts(
+        document,
+        width,
+        palette,
+        &HashMap::new(),
+        gap_states,
+        spinner_frame,
+    )
+}
+
+pub fn render_document_with_state_and_file_counts(
+    document: &Document,
+    width: usize,
+    palette: &TintPalette,
+    file_line_counts: &HashMap<String, usize>,
+    gap_states: &HashMap<GapId, GapState>,
+    spinner_frame: usize,
+) -> RenderedDocument {
     let layout = layout_for(document, width);
     let mut output = RenderedDocument::new(pane_layout(document, width));
     let mut index = 0usize;
@@ -246,6 +264,7 @@ pub fn render_document_with_state(
                     width,
                     layout,
                     palette,
+                    file_line_counts,
                     gap_states,
                     spinner_frame,
                     &mut output,
@@ -264,6 +283,7 @@ pub fn render_document_with_state(
                     width,
                     layout,
                     palette,
+                    file_line_counts,
                     gap_states,
                     spinner_frame,
                     &mut output,
@@ -283,6 +303,22 @@ pub fn render_inline_document(document: &Document, _width: usize, palette: &Tint
 pub fn render_inline_document_with_state(
     document: &Document,
     palette: &TintPalette,
+    gap_states: &HashMap<GapId, GapState>,
+    spinner_frame: usize,
+) -> RenderedDocument {
+    render_inline_document_with_state_and_file_counts(
+        document,
+        palette,
+        &HashMap::new(),
+        gap_states,
+        spinner_frame,
+    )
+}
+
+pub fn render_inline_document_with_state_and_file_counts(
+    document: &Document,
+    palette: &TintPalette,
+    file_line_counts: &HashMap<String, usize>,
     gap_states: &HashMap<GapId, GapState>,
     spinner_frame: usize,
 ) -> RenderedDocument {
@@ -308,6 +344,7 @@ pub fn render_inline_document_with_state(
                     &document.items[index + 1..section_end],
                     line_number_width,
                     palette,
+                    file_line_counts,
                     gap_states,
                     spinner_frame,
                     &mut output,
@@ -324,6 +361,7 @@ pub fn render_inline_document_with_state(
                     &document.items[index..section_end],
                     line_number_width,
                     palette,
+                    file_line_counts,
                     gap_states,
                     spinner_frame,
                     &mut output,
@@ -341,6 +379,7 @@ fn render_inline_file_section(
     items: &[Item],
     line_number_width: usize,
     palette: &TintPalette,
+    file_line_counts: &HashMap<String, usize>,
     gap_states: &HashMap<GapId, GapState>,
     spinner_frame: usize,
     output: &mut RenderedDocument,
@@ -364,40 +403,20 @@ fn render_inline_file_section(
                 if let Some((start_line, elided)) =
                     omitted_range_above(items, &hunk_positions, hunk_index, hunk)
                 {
-                    let gap = GapDescriptor {
-                        id: GapId {
-                            file_path: file_path.to_owned(),
-                            hunk_index,
+                    render_inline_gap(
+                        GapDescriptor {
+                            id: GapId {
+                                file_path: file_path.to_owned(),
+                                hunk_index,
+                            },
+                            start_line,
+                            line_count: elided,
                         },
-                        start_line,
-                        line_count: elided,
-                    };
-                    match gap_states.get(&gap.id) {
-                        Some(GapState::Expanded(state)) => {
-                            render_inline_gap_state(&gap, line_number_width, output, state);
-                        }
-                        Some(GapState::Loading(_)) => {
-                            output.push_line(
-                                render_inline_spinner(line_number_width, spinner_frame),
-                                Some(gap),
-                                None,
-                            );
-                        }
-                        Some(GapState::CollapsedSelector) => {
-                            output.push_line(
-                                render_inline_selector(line_number_width),
-                                Some(gap),
-                                None,
-                            );
-                        }
-                        None => {
-                            output.push_line(
-                                render_inline_ellipsis(line_number_width, elided),
-                                Some(gap),
-                                None,
-                            );
-                        }
-                    }
+                        line_number_width,
+                        gap_states,
+                        spinner_frame,
+                        output,
+                    );
                 }
 
                 let mut old_line = hunk.old_start;
@@ -475,6 +494,27 @@ fn render_inline_file_section(
                         }
                     }
                 }
+
+                if hunk_index + 1 == hunk_positions.len() {
+                    if let Some((start_line, elided)) =
+                        omitted_range_below(hunk, file_line_counts.get(file_path).copied())
+                    {
+                        render_inline_gap(
+                            GapDescriptor {
+                                id: GapId {
+                                    file_path: file_path.to_owned(),
+                                    hunk_index: hunk_positions.len(),
+                                },
+                                start_line,
+                                line_count: elided,
+                            },
+                            line_number_width,
+                            gap_states,
+                            spinner_frame,
+                            output,
+                        );
+                    }
+                }
             }
             Item::Meta(_) | Item::FileHeader(_) => {}
         }
@@ -487,6 +527,7 @@ fn render_file_section(
     width: usize,
     layout: Layout,
     palette: &TintPalette,
+    file_line_counts: &HashMap<String, usize>,
     gap_states: &HashMap<GapId, GapState>,
     spinner_frame: usize,
     output: &mut RenderedDocument,
@@ -514,32 +555,21 @@ fn render_file_section(
                 if let Some((start_line, elided)) =
                     omitted_range_above(items, &hunk_positions, hunk_index, hunk)
                 {
-                    let gap = GapDescriptor {
-                        id: GapId {
-                            file_path: file_path.to_owned(),
-                            hunk_index,
+                    render_gap(
+                        GapDescriptor {
+                            id: GapId {
+                                file_path: file_path.to_owned(),
+                                hunk_index,
+                            },
+                            start_line,
+                            line_count: elided,
                         },
-                        start_line,
-                        line_count: elided,
-                    };
-                    match gap_states.get(&gap.id) {
-                        Some(GapState::Expanded(state)) => {
-                            render_gap_state(&gap, layout, palette, output, state);
-                        }
-                        Some(GapState::Loading(_)) => {
-                            output.push_line(
-                                render_compact_spinner_row(layout, spinner_frame),
-                                Some(gap),
-                                None,
-                            );
-                        }
-                        Some(GapState::CollapsedSelector) => {
-                            output.push_line(render_compact_selector_row(layout), Some(gap), None);
-                        }
-                        None => {
-                            output.push_line(render_compact_elision_row(layout), Some(gap), None);
-                        }
-                    }
+                        layout,
+                        palette,
+                        gap_states,
+                        spinner_frame,
+                        output,
+                    );
                     show_gap_continuation = true;
                 }
 
@@ -557,6 +587,28 @@ fn render_file_section(
                         rendered,
                         &mut show_gap_continuation,
                     );
+                }
+
+                if hunk_index + 1 == hunk_positions.len() {
+                    if let Some((start_line, elided)) =
+                        omitted_range_below(hunk, file_line_counts.get(file_path).copied())
+                    {
+                        render_gap(
+                            GapDescriptor {
+                                id: GapId {
+                                    file_path: file_path.to_owned(),
+                                    hunk_index: hunk_positions.len(),
+                                },
+                                start_line,
+                                line_count: elided,
+                            },
+                            layout,
+                            palette,
+                            gap_states,
+                            spinner_frame,
+                            output,
+                        );
+                    }
                 }
             }
             Item::FileHeader(_) => {}
@@ -717,6 +769,17 @@ fn omitted_range_above(
     }
 }
 
+fn omitted_range_below(hunk: &Hunk, total_lines: Option<usize>) -> Option<(usize, usize)> {
+    let total_lines = total_lines?;
+    let start_line = hunk_end(hunk) + 1;
+    let line_count = total_lines.saturating_sub(start_line.saturating_sub(1));
+    if line_count == 0 {
+        None
+    } else {
+        Some((start_line, line_count))
+    }
+}
+
 fn hunk_end(hunk: &Hunk) -> usize {
     if hunk.new_len == 0 {
         hunk.new_start.saturating_sub(1)
@@ -842,6 +905,41 @@ fn render_inline_gap_state(
             line_number_width,
             output,
         );
+    }
+}
+
+fn render_inline_gap(
+    gap: GapDescriptor,
+    line_number_width: usize,
+    gap_states: &HashMap<GapId, GapState>,
+    spinner_frame: usize,
+    output: &mut RenderedDocument,
+) {
+    match gap_states.get(&gap.id) {
+        Some(GapState::Expanded(state)) => {
+            render_inline_gap_state(&gap, line_number_width, output, state);
+        }
+        Some(GapState::Loading(_)) => {
+            output.push_line(
+                render_inline_spinner(line_number_width, spinner_frame),
+                Some(gap),
+                None,
+            );
+        }
+        Some(GapState::CollapsedSelector) => {
+            output.push_line(
+                render_inline_selector(line_number_width),
+                Some(gap),
+                None,
+            );
+        }
+        None => {
+            output.push_line(
+                render_inline_ellipsis(line_number_width, gap.line_count),
+                Some(gap),
+                None,
+            );
+        }
     }
 }
 
@@ -1066,6 +1164,34 @@ fn render_gap_state(
     }
 }
 
+fn render_gap(
+    gap: GapDescriptor,
+    layout: Layout,
+    palette: &TintPalette,
+    gap_states: &HashMap<GapId, GapState>,
+    spinner_frame: usize,
+    output: &mut RenderedDocument,
+) {
+    match gap_states.get(&gap.id) {
+        Some(GapState::Expanded(state)) => {
+            render_gap_state(&gap, layout, palette, output, state);
+        }
+        Some(GapState::Loading(_)) => {
+            output.push_line(
+                render_compact_spinner_row(layout, spinner_frame),
+                Some(gap),
+                None,
+            );
+        }
+        Some(GapState::CollapsedSelector) => {
+            output.push_line(render_compact_selector_row(layout), Some(gap), None);
+        }
+        None => {
+            output.push_line(render_compact_elision_row(layout), Some(gap), None);
+        }
+    }
+}
+
 fn push_rendered_row(
     output: &mut RenderedDocument,
     width: usize,
@@ -1278,7 +1404,9 @@ mod tests {
     use super::render_compact_elision_row;
     use super::render_document;
     use super::render_document_with_state;
+    use super::render_document_with_state_and_file_counts;
     use super::render_inline_document;
+    use super::render_inline_document_with_state_and_file_counts;
     use super::render_inline_inserted_line;
     use super::render_styled_cell;
     use crate::terminal_palette::AnsiColor;
@@ -1627,5 +1755,76 @@ mod tests {
         assert!(rendered.lines[2].contains("▴⋮▾"));
         assert!(rendered.lines[3].contains("delta"));
         assert!(rendered.line_metadata[2].gap.is_some());
+    }
+
+    #[test]
+    fn renders_trailing_gap_after_last_hunk() {
+        let document = Document::from_items(vec![
+            Item::FileHeader("demo.txt".into()),
+            Item::Hunk(Hunk {
+                old_start: 1,
+                new_start: 1,
+                new_len: 1,
+                rows: vec![Row::Context("alpha".into())],
+            }),
+        ]);
+        let file_line_counts = HashMap::from([(String::from("demo.txt"), 4usize)]);
+
+        let rendered = render_document_with_state_and_file_counts(
+            &document,
+            140,
+            &TintPalette::default(),
+            &file_line_counts,
+            &HashMap::new(),
+            0,
+        );
+
+        assert!(rendered.lines[2].contains('⋮'));
+        assert_eq!(
+            rendered.line_metadata[2].gap,
+            Some(super::GapDescriptor {
+                id: GapId {
+                    file_path: "demo.txt".into(),
+                    hunk_index: 1,
+                },
+                start_line: 2,
+                line_count: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn renders_inline_trailing_gap_after_last_hunk() {
+        let document = Document::from_items(vec![
+            Item::FileHeader("demo.txt".into()),
+            Item::Hunk(Hunk {
+                old_start: 2,
+                new_start: 2,
+                new_len: 1,
+                rows: vec![Row::Context("beta".into())],
+            }),
+        ]);
+        let file_line_counts = HashMap::from([(String::from("demo.txt"), 5usize)]);
+
+        let rendered = render_inline_document_with_state_and_file_counts(
+            &document,
+            &TintPalette::default(),
+            &file_line_counts,
+            &HashMap::new(),
+            0,
+        );
+
+        assert!(rendered.lines[3].contains('⋮'));
+        assert_eq!(
+            rendered.line_metadata[3].gap,
+            Some(super::GapDescriptor {
+                id: GapId {
+                    file_path: "demo.txt".into(),
+                    hunk_index: 1,
+                },
+                start_line: 3,
+                line_count: 3,
+            })
+        );
     }
 }
