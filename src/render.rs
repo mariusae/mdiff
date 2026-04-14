@@ -142,6 +142,7 @@ impl RenderedDocument {
 struct StyledLine {
     text: String,
     background: Option<AnsiColor>,
+    dim: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -157,6 +158,7 @@ enum RenderedRow {
     SideBySide {
         left_text: String,
         left_background: Option<AnsiColor>,
+        left_dim: bool,
         center_number: String,
         right_gutter: bool,
         right_line: StyledLine,
@@ -789,6 +791,7 @@ fn render_row(
             RenderedRow::SideBySide {
                 left_text: line.clone(),
                 left_background: None,
+                left_dim: false,
                 center_number: format_right_line_number(Some(right_number)),
                 right_gutter: false,
                 right_line: StyledLine {
@@ -803,6 +806,7 @@ fn render_row(
             RenderedRow::SideBySide {
                 left_text: expand_tabs(text),
                 left_background: palette.changed_line_bg,
+                left_dim: true,
                 center_number: format_right_line_number(None),
                 right_gutter: false,
                 right_line: StyledLine::default(),
@@ -815,6 +819,7 @@ fn render_row(
             RenderedRow::SideBySide {
                 left_text: String::new(),
                 left_background: None,
+                left_dim: false,
                 center_number: format_right_line_number(Some(right_number)),
                 right_gutter: true,
                 right_line: StyledLine {
@@ -831,6 +836,7 @@ fn render_row(
             RenderedRow::SideBySide {
                 left_text: expand_tabs(old),
                 left_background: palette.changed_line_bg,
+                left_dim: true,
                 center_number: format_right_line_number(Some(right_number)),
                 right_gutter: true,
                 right_line: StyledLine {
@@ -855,6 +861,7 @@ fn render_expanded_gap_lines(
         let rendered = RenderedRow::SideBySide {
             left_text: expanded.clone(),
             left_background: None,
+            left_dim: false,
             center_number: format_right_line_number(Some(start_line + offset)),
             right_gutter: false,
             right_line: StyledLine {
@@ -886,6 +893,7 @@ fn push_rendered_row(
         RenderedRow::SideBySide {
             mut left_text,
             left_background,
+            left_dim,
             center_number,
             right_gutter,
             right_line,
@@ -896,14 +904,12 @@ fn push_rendered_row(
             *show_gap_continuation = false;
 
             let mut line = String::new();
-            let left_cell = render_plain_cell(&left_text, layout.left_text_width);
-            if let Some(bg) = left_background {
-                line.push_str(&ansi_bg(bg));
-                line.push_str(&left_cell);
-                line.push_str("\u{1b}[0m");
-            } else {
-                line.push_str(&left_cell);
-            }
+            line.push_str(&render_plain_cell_with_style(
+                &left_text,
+                layout.left_text_width,
+                left_background,
+                left_dim,
+            ));
             line.push_str(PANE_GAP);
             line.push_str(&render_center_number(
                 &center_number,
@@ -939,6 +945,30 @@ fn render_plain_cell(text: &str, width: usize) -> String {
     let clipped = clip_plain_text(text, width);
     let pad = width.saturating_sub(display_width(&clipped));
     format!("{clipped}{}", " ".repeat(pad))
+}
+
+fn render_plain_cell_with_style(
+    text: &str,
+    width: usize,
+    background: Option<AnsiColor>,
+    dim: bool,
+) -> String {
+    let visible = clip_plain_text(text, width);
+    let pad = " ".repeat(width.saturating_sub(display_width(&visible)));
+
+    match (background, dim, visible.is_empty()) {
+        (Some(bg), true, false) => {
+            format!(
+                "{}\u{1b}[2m{visible}\u{1b}[0m{}{}\u{1b}[0m",
+                ansi_bg(bg),
+                ansi_bg(bg),
+                pad
+            )
+        }
+        (Some(bg), _, _) => format!("{}{visible}{}\u{1b}[0m", ansi_bg(bg), pad),
+        (None, true, false) => format!("\u{1b}[2m{visible}\u{1b}[0m{pad}"),
+        (None, _, _) => format!("{visible}{pad}"),
+    }
 }
 
 fn render_center_number(label: &str, width: usize) -> String {
@@ -1097,8 +1127,8 @@ mod tests {
         assert!(rendered.contains("\u{1b}[1mdemo.txt\u{1b}[0m"));
         assert!(rendered.contains("⋮"));
         assert!(!rendered.contains("@@ -1 +1 @@"));
-        // left (deleted) side has tinted background
-        assert!(rendered.contains("\u{1b}[48;5;240mcat"));
+        // left (deleted) side has tinted background and dims the removed text payload
+        assert!(rendered.contains("\u{1b}[48;5;240m\u{1b}[2mcat\u{1b}[0m"));
         // right (added) side has gutter mark (foreground color)
         assert!(rendered.contains("\u{1b}[48;5;238m \u{1b}[0mcot"));
         assert!(rendered.contains("\u{1b}[1m 3  \u{1b}[0m"));
@@ -1313,6 +1343,7 @@ mod tests {
         let line = StyledLine {
             text: "abc".into(),
             background: Some(AnsiColor::Indexed(240)),
+            dim: false,
         };
 
         let rendered = render_styled_cell(&line, 20);
