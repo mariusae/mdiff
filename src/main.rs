@@ -87,6 +87,13 @@ fn run() -> Result<i32> {
     );
     let render_snapshot = Arc::clone(&snapshot);
     let fetch_snapshot = Arc::clone(&snapshot);
+    let edit_snapshot = Arc::clone(&snapshot);
+    let edit_cwd = cwd.clone();
+    let edit_root = detection.root.clone();
+    let edit_args = args.clone();
+    let working_tree_cwd = cwd.clone();
+    let working_tree_root = detection.root.clone();
+    let working_tree_args = args.clone();
     let list_snapshot = Arc::clone(&snapshot);
     let rendered = pager::page_or_render(
         files,
@@ -137,6 +144,31 @@ fn run() -> Result<i32> {
                     .files
                     .clone()
             }
+        },
+        move |path| {
+            let git_right_blobs = edit_snapshot
+                .lock()
+                .expect("snapshot lock poisoned")
+                .document
+                .git_right_blob_by_path();
+            let fetcher = backend::FileFetcher::new(
+                backend,
+                edit_cwd.clone(),
+                edit_root.clone(),
+                edit_args.clone(),
+                git_right_blobs,
+            );
+            fetcher.resolve_edit_target(path)
+        },
+        move |path| {
+            let fetcher = backend::FileFetcher::new(
+                backend,
+                working_tree_cwd.clone(),
+                working_tree_root.clone(),
+                working_tree_args.clone(),
+                HashMap::new(),
+            );
+            fetcher.working_tree_path(path)
         },
         refresh_rx,
     )?;

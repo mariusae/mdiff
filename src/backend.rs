@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
 use std::time::Duration;
+use tempfile::NamedTempFile;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Backend {
@@ -42,6 +43,24 @@ pub struct LiveRefreshConfig {
     pub mode: LiveRefreshMode,
     pub watch_root: PathBuf,
     pub poll_interval: Duration,
+}
+
+#[derive(Debug)]
+pub enum EditTarget {
+    WorkingTree(PathBuf),
+    Snapshot {
+        path: PathBuf,
+        _guard: NamedTempFile,
+    },
+}
+
+impl EditTarget {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::WorkingTree(path) => path,
+            Self::Snapshot { path, .. } => path,
+        }
+    }
 }
 
 pub fn detect(cwd: &Path) -> Backend {
@@ -190,6 +209,55 @@ impl FileFetcher {
             Backend::Hg => self.fetch_hg_right_file(path),
             Backend::PlainDiff => fs::read_to_string(self.cwd.join(path))
                 .with_context(|| format!("failed to read {path} from disk")),
+        }
+    }
+
+    pub fn working_tree_path(&self, path: &str) -> PathBuf {
+        let base = self.root.as_ref().unwrap_or(&self.cwd);
+        base.join(path)
+    }
+
+    pub fn resolve_edit_target(&self, path: &str) -> Result<EditTarget> {
+        if self.is_right_working_tree(path) {
+            let base = self.root.as_ref().unwrap_or(&self.cwd);
+            return Ok(EditTarget::WorkingTree(base.join(path)));
+        }
+
+        let content = self.fetch_right_file(path)?;
+        let suffix = Path::new(path)
+            .extension()
+            .map(|ext| {
+                let mut s = String::from(".");
+                s.push_str(&ext.to_string_lossy());
+                s
+            })
+            .unwrap_or_default();
+        let temp = tempfile::Builder::new()
+            .prefix("mdiff-")
+            .suffix(&suffix)
+            .tempfile()
+            .context("failed to create temp file for edit")?;
+        fs::write(temp.path(), content).context("failed to write edit snapshot to temp file")?;
+        let path = temp.path().to_path_buf();
+        Ok(EditTarget::Snapshot { path, _guard: temp })
+    }
+
+    fn is_right_working_tree(&self, path: &str) -> bool {
+        match self.backend {
+            Backend::PlainDiff => true,
+            Backend::Git => {
+                if has_flag(&self.args, "--cached") || has_flag(&self.args, "--staged") {
+                    return false;
+                }
+                if git_diff_uses_working_tree(
+                    self.root.as_deref().unwrap_or(&self.cwd),
+                    &self.args,
+                ) {
+                    return true;
+                }
+                !self.git_right_blobs.contains_key(path)
+            }
+            Backend::Hg => last_flag_value(&self.args, &["-r", "--rev"]).is_none(),
         }
     }
 

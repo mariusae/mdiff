@@ -1,3 +1,4 @@
+use crate::backend::EditTarget;
 use crate::render::ExpandedGapState;
 use crate::render::GapDescriptor;
 use crate::render::GapExpandRequest;
@@ -31,9 +32,14 @@ use crossterm::terminal::ClearType;
 use crossterm::terminal::EnterAlternateScreen;
 use crossterm::terminal::LeaveAlternateScreen;
 use std::collections::HashMap;
+use std::env;
+use std::ffi::OsString;
 use std::io;
 use std::io::IsTerminal;
 use std::io::Write;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
@@ -76,6 +82,10 @@ const HELP_LINES: &[&str] = &[
     "  Up/Down     jump between files",
     "  Backspace   delete filter text",
     "  Enter/Esc   close file filter",
+    "",
+    "Edit",
+    "  e           open current file in $EDITOR",
+    "  B           open checked-out file in B",
     "",
     "Press ? or Esc to close this help.",
 ];
@@ -151,17 +161,21 @@ struct GapFetchResult {
     lines: Result<Vec<String>, String>,
 }
 
-pub fn page_or_render<F, G>(
+pub fn page_or_render<F, G, E, W>(
     files: Vec<String>,
     force_pager: bool,
     render: F,
     fetch_gap: G,
     list_files: impl Fn() -> Vec<String> + Send + Sync + 'static,
+    edit: E,
+    working_tree: W,
     refresh_rx: Option<Receiver<()>>,
 ) -> Result<Option<String>>
 where
     F: Fn(usize, &str, &TintPalette, &HashMap<GapId, GapState>, usize) -> RenderedDocument,
     G: Fn(&GapDescriptor) -> Result<Vec<String>> + Send + Sync + 'static,
+    E: Fn(&str) -> Result<EditTarget>,
+    W: Fn(&str) -> PathBuf,
 {
     let palette = TintPalette::detect();
 
@@ -186,6 +200,8 @@ where
         render,
         fetch_gap,
         list_files,
+        edit,
+        working_tree,
         refresh_rx,
         width,
         rows,
@@ -195,11 +211,13 @@ where
     Ok(None)
 }
 
-fn page<F, G, H>(
+fn page<F, G, H, E, W>(
     files: Vec<String>,
     render: F,
     fetch_gap: G,
     list_files: H,
+    edit: E,
+    working_tree: W,
     refresh_rx: Option<Receiver<()>>,
     width: usize,
     height: usize,
@@ -210,12 +228,16 @@ where
     F: Fn(usize, &str, &TintPalette, &HashMap<GapId, GapState>, usize) -> RenderedDocument,
     G: Fn(&GapDescriptor) -> Result<Vec<String>> + Send + Sync + 'static,
     H: Fn() -> Vec<String> + Send + Sync + 'static,
+    E: Fn(&str) -> Result<EditTarget>,
+    W: Fn(&str) -> PathBuf,
 {
     let mut stdout = io::stdout();
     let mut state = PagerState::new(
         render,
         fetch_gap,
         list_files,
+        edit,
+        working_tree,
         refresh_rx,
         width,
         height,
@@ -249,11 +271,16 @@ where
     result
 }
 
-fn run_pager<F, G, H>(stdout: &mut io::Stdout, state: &mut PagerState<F, G, H>) -> Result<()>
+fn run_pager<F, G, H, E, W>(
+    stdout: &mut io::Stdout,
+    state: &mut PagerState<F, G, H, E, W>,
+) -> Result<()>
 where
     F: Fn(usize, &str, &TintPalette, &HashMap<GapId, GapState>, usize) -> RenderedDocument,
     G: Fn(&GapDescriptor) -> Result<Vec<String>> + Send + Sync + 'static,
     H: Fn() -> Vec<String> + Send + Sync + 'static,
+    E: Fn(&str) -> Result<EditTarget>,
+    W: Fn(&str) -> PathBuf,
 {
     let mut needs_redraw = true;
 
@@ -315,6 +342,14 @@ where
                         state.to_bottom();
                         needs_redraw = true;
                     }
+                    KeyCode::Char('e') => {
+                        state.edit_current_file(stdout)?;
+                        needs_redraw = true;
+                    }
+                    KeyCode::Char('B') => {
+                        state.open_current_in_b(stdout)?;
+                        needs_redraw = true;
+                    }
                     _ => {}
                 }
             }
@@ -330,10 +365,6 @@ where
                         let row = mouse.row as usize;
                         if let Some(content_row) = state.content_row_from_screen(row) {
                             let content_col = state.horizontal_offset + mouse.column as usize;
-                            if state.try_activate_gap(content_row, content_col, MouseButton::Left) {
-                                needs_redraw = true;
-                                continue;
-                            }
                             let line = state.offset + content_row;
                             let pane = state.pane_at_column(content_col);
                             state.selection = Some(Selection {
@@ -370,20 +401,22 @@ where
                         let row = mouse.row as usize;
                         if let Some(content_row) = state.content_row_from_screen(row) {
                             let content_col = state.horizontal_offset + mouse.column as usize;
-                            if state.selection.is_none()
-                                && state.try_activate_gap(
-                                    content_row,
-                                    content_col,
-                                    MouseButton::Left,
-                                )
-                            {
-                                needs_redraw = true;
-                                continue;
-                            }
                             let max_row = state.viewport_height().saturating_sub(1);
                             let line = state.offset + content_row.min(max_row);
                             if let Some(ref mut sel) = state.selection {
                                 sel.extent_line = line;
+                            }
+                            let is_gap_click = state.selection.as_ref().is_some_and(|sel| {
+                                sel.anchor_line == line && sel.extent_line == line
+                            }) && state.try_activate_gap(
+                                content_row,
+                                content_col,
+                                MouseButton::Left,
+                            );
+                            if is_gap_click {
+                                state.selection = None;
+                                needs_redraw = true;
+                                continue;
                             }
                         }
                         let text = state.extract_selection_text();
@@ -412,11 +445,13 @@ where
     }
 }
 
-fn draw<F, G, H>(stdout: &mut io::Stdout, state: &PagerState<F, G, H>) -> Result<()>
+fn draw<F, G, H, E, W>(stdout: &mut io::Stdout, state: &PagerState<F, G, H, E, W>) -> Result<()>
 where
     F: Fn(usize, &str, &TintPalette, &HashMap<GapId, GapState>, usize) -> RenderedDocument,
     G: Fn(&GapDescriptor) -> Result<Vec<String>> + Send + Sync + 'static,
     H: Fn() -> Vec<String> + Send + Sync + 'static,
+    E: Fn(&str) -> Result<EditTarget>,
+    W: Fn(&str) -> PathBuf,
 {
     let hud_lines = state.hud_lines();
     let sticky_row = usize::from(state.has_sticky_header());
@@ -474,6 +509,105 @@ fn should_page_output(
     terminal_rows: usize,
 ) -> bool {
     stdout_is_tty && (force_pager || output_line_count > terminal_rows)
+}
+
+fn suspend_terminal(stdout: &mut io::Stdout) -> Result<()> {
+    execute!(
+        stdout,
+        cursor::Show,
+        DisableFocusChange,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )
+    .context("failed to leave pager screen")?;
+    terminal::disable_raw_mode().context("failed to disable raw mode")
+}
+
+fn resume_terminal(stdout: &mut io::Stdout) -> Result<()> {
+    terminal::enable_raw_mode().context("failed to re-enable raw mode")?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableFocusChange,
+        cursor::Hide
+    )
+    .context("failed to re-enter pager screen")
+}
+
+fn spawn_editor(path: &Path, line: Option<usize>) -> Result<()> {
+    let (program, prefix_args) = resolve_editor_command();
+    spawn_with_prefix(&program, &prefix_args, path, line)
+}
+
+fn spawn_program(program: &OsString, path: &Path, line: Option<usize>) -> Result<()> {
+    spawn_with_prefix(program, &[], path, line)
+}
+
+fn spawn_with_prefix(
+    program: &OsString,
+    prefix_args: &[OsString],
+    path: &Path,
+    line: Option<usize>,
+) -> Result<()> {
+    let mut args: Vec<OsString> = prefix_args.to_vec();
+    match line.and_then(|line| editor_line_style(program, line)) {
+        Some(EditorLineArg::Plus(arg)) => {
+            args.push(arg);
+            args.push(path.as_os_str().to_owned());
+        }
+        Some(EditorLineArg::ColonSuffix(suffix)) => {
+            let mut combined = path.as_os_str().to_owned();
+            combined.push(&suffix);
+            args.push(combined);
+        }
+        None => args.push(path.as_os_str().to_owned()),
+    }
+    let status = Command::new(program)
+        .args(&args)
+        .status()
+        .with_context(|| format!("failed to spawn {program:?}"))?;
+    if !status.success() {
+        anyhow::bail!("{program:?} exited with status {}", status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+fn resolve_editor_command() -> (OsString, Vec<OsString>) {
+    let raw = env::var_os("VISUAL")
+        .or_else(|| env::var_os("EDITOR"))
+        .unwrap_or_else(|| OsString::from("vi"));
+    let mut parts = raw
+        .to_string_lossy()
+        .split_whitespace()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return (OsString::from("vi"), Vec::new());
+    }
+    let program = parts.remove(0);
+    (program, parts)
+}
+
+enum EditorLineArg {
+    Plus(OsString),
+    ColonSuffix(OsString),
+}
+
+fn editor_line_style(program: &OsString, line: usize) -> Option<EditorLineArg> {
+    let name = Path::new(program)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match name.as_str() {
+        "vi" | "vim" | "nvim" | "view" | "ex" | "nano" | "pico" | "emacs" | "emacsclient" => {
+            Some(EditorLineArg::Plus(OsString::from(format!("+{line}"))))
+        }
+        "ion" | "hx" | "helix" | "zed" | "code" | "subl" => Some(EditorLineArg::ColonSuffix(
+            OsString::from(format!(":{line}")),
+        )),
+        _ => None,
+    }
 }
 
 fn clip_ansi_text(text: &str, width: usize) -> String {
@@ -1014,16 +1148,19 @@ fn char_width(ch: char) -> usize {
     UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
-#[derive(Debug)]
-struct PagerState<F, G, H>
+struct PagerState<F, G, H, E, W>
 where
     F: Fn(usize, &str, &TintPalette, &HashMap<GapId, GapState>, usize) -> RenderedDocument,
     G: Fn(&GapDescriptor) -> Result<Vec<String>> + Send + Sync + 'static,
     H: Fn() -> Vec<String> + Send + Sync + 'static,
+    E: Fn(&str) -> Result<EditTarget>,
+    W: Fn(&str) -> PathBuf,
 {
     render: F,
     fetch_gap: Arc<G>,
     list_files: Arc<H>,
+    edit: E,
+    working_tree: W,
     palette: TintPalette,
     gap_states: HashMap<GapId, GapState>,
     line_gaps: Vec<Option<GapDescriptor>>,
@@ -1052,16 +1189,20 @@ where
     last_spinner_tick: Instant,
 }
 
-impl<F, G, H> PagerState<F, G, H>
+impl<F, G, H, E, W> PagerState<F, G, H, E, W>
 where
     F: Fn(usize, &str, &TintPalette, &HashMap<GapId, GapState>, usize) -> RenderedDocument,
     G: Fn(&GapDescriptor) -> Result<Vec<String>> + Send + Sync + 'static,
     H: Fn() -> Vec<String> + Send + Sync + 'static,
+    E: Fn(&str) -> Result<EditTarget>,
+    W: Fn(&str) -> PathBuf,
 {
     fn new(
         render: F,
         fetch_gap: G,
         list_files: H,
+        edit: E,
+        working_tree: W,
         refresh_rx: Option<Receiver<()>>,
         width: usize,
         height: usize,
@@ -1089,6 +1230,8 @@ where
             render,
             fetch_gap: Arc::new(fetch_gap),
             list_files: Arc::new(list_files),
+            edit,
+            working_tree,
             palette,
             gap_states: HashMap::new(),
             line_gaps,
@@ -1476,6 +1619,56 @@ where
 
     fn refresh_palette_from_terminal(&mut self) {
         self.apply_palette(TintPalette::detect(), search_highlight_bg());
+    }
+
+    fn current_edit_source(&self) -> Option<(String, Option<usize>)> {
+        for line in self.offset..self.line_sources.len() {
+            if let Some(source) = self.line_sources.get(line).and_then(|s| s.as_ref()) {
+                return Some((source.file_path.clone(), source.right_line_number));
+            }
+        }
+        let name = self
+            .current_top_file_index()
+            .and_then(|index| self.file_headers.get(index))
+            .map(|header| header.name.clone())?;
+        Some((name, None))
+    }
+
+    fn edit_current_file(&mut self, stdout: &mut io::Stdout) -> Result<()> {
+        let Some((path, line)) = self.current_edit_source() else {
+            return Ok(());
+        };
+        let target = match (self.edit)(&path) {
+            Ok(target) => target,
+            Err(_) => return Ok(()),
+        };
+        suspend_terminal(stdout)?;
+        let spawn_result = spawn_editor(target.path(), line);
+        resume_terminal(stdout)?;
+        drop(target);
+        if let Err(err) = spawn_result {
+            eprintln!("mdiff: {err:#}");
+        }
+        self.refresh_palette_from_terminal();
+        Ok(())
+    }
+
+    fn open_current_in_b(&mut self, stdout: &mut io::Stdout) -> Result<()> {
+        let Some((path, line)) = self.current_edit_source() else {
+            return Ok(());
+        };
+        let working_path = (self.working_tree)(&path);
+        if !working_path.exists() {
+            return Ok(());
+        }
+        suspend_terminal(stdout)?;
+        let spawn_result = spawn_program(&OsString::from("B"), &working_path, line);
+        resume_terminal(stdout)?;
+        if let Err(err) = spawn_result {
+            eprintln!("mdiff: {err:#}");
+        }
+        self.refresh_palette_from_terminal();
+        Ok(())
     }
 
     fn apply_palette(&mut self, palette: TintPalette, search_bg: Option<AnsiColor>) {
@@ -2284,6 +2477,14 @@ mod tests {
         Ok(Vec::new())
     }
 
+    fn noop_edit(_: &str) -> Result<crate::backend::EditTarget> {
+        anyhow::bail!("edit unsupported in tests")
+    }
+
+    fn noop_working_tree(path: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(path)
+    }
+
     fn new_state<F>(
         render: F,
         width: usize,
@@ -2294,6 +2495,8 @@ mod tests {
         F,
         fn(&GapDescriptor) -> Result<Vec<String>>,
         Box<dyn Fn() -> Vec<String> + Send + Sync>,
+        fn(&str) -> Result<crate::backend::EditTarget>,
+        fn(&str) -> std::path::PathBuf,
     >
     where
         F: Fn(usize, &str, &TintPalette, &HashMap<GapId, GapState>, usize) -> RenderedDocument,
@@ -2303,6 +2506,8 @@ mod tests {
             render,
             noop_fetch as fn(&GapDescriptor) -> Result<Vec<String>>,
             Box::new(move || listed_files.clone()),
+            noop_edit as fn(&str) -> Result<crate::backend::EditTarget>,
+            noop_working_tree as fn(&str) -> std::path::PathBuf,
             None,
             width,
             height,
@@ -2443,6 +2648,8 @@ mod tests {
             },
             move |_| Ok(vec!["one".into(), "two".into()]),
             Box::new(Vec::new),
+            noop_edit as fn(&str) -> Result<crate::backend::EditTarget>,
+            noop_working_tree as fn(&str) -> std::path::PathBuf,
             None,
             80,
             5,
@@ -2495,6 +2702,8 @@ mod tests {
             },
             move |_| Ok(vec!["alpha".into(), "beta".into()]),
             Box::new(Vec::new),
+            noop_edit as fn(&str) -> Result<crate::backend::EditTarget>,
+            noop_working_tree as fn(&str) -> std::path::PathBuf,
             None,
             80,
             5,
@@ -2539,6 +2748,8 @@ mod tests {
             move |_, _, _, _, _| rendered.clone(),
             move |_| Ok(Vec::new()),
             Box::new(Vec::new),
+            noop_edit as fn(&str) -> Result<crate::backend::EditTarget>,
+            noop_working_tree as fn(&str) -> std::path::PathBuf,
             None,
             80,
             5,
@@ -2595,6 +2806,8 @@ mod tests {
             |_, _, _, _, _| RenderedDocument::default(),
             noop_fetch as fn(&GapDescriptor) -> Result<Vec<String>>,
             Box::new(Vec::new),
+            noop_edit as fn(&str) -> Result<crate::backend::EditTarget>,
+            noop_working_tree as fn(&str) -> std::path::PathBuf,
             None,
             80,
             5,
@@ -3045,6 +3258,8 @@ mod tests {
             },
             noop_fetch as fn(&GapDescriptor) -> Result<Vec<String>>,
             Box::new(Vec::new),
+            noop_edit as fn(&str) -> Result<crate::backend::EditTarget>,
+            noop_working_tree as fn(&str) -> std::path::PathBuf,
             None,
             80,
             2,
