@@ -603,7 +603,7 @@ fn editor_line_style(program: &OsString, line: usize) -> Option<EditorLineArg> {
         "vi" | "vim" | "nvim" | "view" | "ex" | "nano" | "pico" | "emacs" | "emacsclient" => {
             Some(EditorLineArg::Plus(OsString::from(format!("+{line}"))))
         }
-        "ion" | "hx" | "helix" | "zed" | "code" | "subl" => Some(EditorLineArg::ColonSuffix(
+        "ion" | "hx" | "helix" | "zed" | "code" | "subl" | "B" => Some(EditorLineArg::ColonSuffix(
             OsString::from(format!(":{line}")),
         )),
         _ => None,
