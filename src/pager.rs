@@ -84,8 +84,9 @@ const HELP_LINES: &[&str] = &[
     "  Enter/Esc   close file filter",
     "",
     "Edit",
-    "  e           open current file in $EDITOR",
-    "  B           open checked-out file in B",
+    "  e             open current file in $EDITOR",
+    "  B             open checked-out file in B",
+    "  double-click  open clicked line in B",
     "",
     "Press ? or Esc to close this help.",
 ];
@@ -366,6 +367,14 @@ where
                         if let Some(content_row) = state.content_row_from_screen(row) {
                             let content_col = state.horizontal_offset + mouse.column as usize;
                             let line = state.offset + content_row;
+                            if state.take_double_click(mouse.row, mouse.column) {
+                                state.selection = None;
+                                if let Some((path, right_line)) = state.source_at_line(line) {
+                                    state.open_file_in_b(stdout, &path, right_line)?;
+                                }
+                                needs_redraw = true;
+                                continue;
+                            }
                             let pane = state.pane_at_column(content_col);
                             state.selection = Some(Selection {
                                 pane,
@@ -1187,6 +1196,7 @@ where
     refresh_rx: Option<Receiver<()>>,
     spinner_frame: usize,
     last_spinner_tick: Instant,
+    last_click: Option<(Instant, u16, u16)>,
 }
 
 impl<F, G, H, E, W> PagerState<F, G, H, E, W>
@@ -1258,6 +1268,7 @@ where
             refresh_rx,
             spinner_frame: 0,
             last_spinner_tick: Instant::now(),
+            last_click: None,
         }
     }
 
@@ -1657,7 +1668,16 @@ where
         let Some((path, line)) = self.current_edit_source() else {
             return Ok(());
         };
-        let working_path = (self.working_tree)(&path);
+        self.open_file_in_b(stdout, &path, line)
+    }
+
+    fn open_file_in_b(
+        &mut self,
+        stdout: &mut io::Stdout,
+        path: &str,
+        line: Option<usize>,
+    ) -> Result<()> {
+        let working_path = (self.working_tree)(path);
         if !working_path.exists() {
             return Ok(());
         }
@@ -1669,6 +1689,25 @@ where
         }
         self.refresh_palette_from_terminal();
         Ok(())
+    }
+
+    fn source_at_line(&self, line: usize) -> Option<(String, Option<usize>)> {
+        let source = self.line_sources.get(line).and_then(|s| s.as_ref())?;
+        Some((source.file_path.clone(), source.right_line_number))
+    }
+
+    fn take_double_click(&mut self, row: u16, column: u16) -> bool {
+        let now = Instant::now();
+        let is_double = self
+            .last_click
+            .map(|(prev, prev_row, prev_col)| {
+                now.duration_since(prev) <= Duration::from_millis(400)
+                    && prev_row == row
+                    && prev_col == column
+            })
+            .unwrap_or(false);
+        self.last_click = if is_double { None } else { Some((now, row, column)) };
+        is_double
     }
 
     fn apply_palette(&mut self, palette: TintPalette, search_bg: Option<AnsiColor>) {
